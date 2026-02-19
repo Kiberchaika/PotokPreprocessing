@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Preprocessing Benchmark</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0b0d11; --s1: #13161d; --s2: #1a1e28; --bd: #232837;
+    --t: #cdd4e0; --t2: #7a8299; --ac: #5b7fff; --ac2: #3d5ccc;
+    --g: #34d399; --o: #f59e0b; --r: #f87171;
+    --beats: #34d399; --roformer: #f59e0b; --all: #5b7fff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--t); font: 13px/1.5 'Inter', system-ui, -apple-system, sans-serif; padding: 12px; max-width: 1400px; margin: 0 auto; }
+  header { display: flex; align-items: baseline; gap: 10px; margin-bottom: 12px; padding: 0 2px; flex-wrap: wrap; }
+  header h1 { font-size: 15px; font-weight: 700; letter-spacing: -0.3px; }
+  header span { font-size: 11px; color: var(--t2); }
+  .row { display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+  .card { background: var(--s1); border: 1px solid var(--bd); border-radius: 8px; padding: 10px 12px; flex: 1; min-width: 0; }
+  .card-title { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.6px; color: var(--t2); margin-bottom: 6px; }
+  .sl { margin-bottom: 8px; }
+  .sl:last-child { margin-bottom: 0; }
+  .sl-head { display: flex; justify-content: space-between; font-size: 11px; margin-bottom: 3px; }
+  .sl-head .v { color: var(--ac); font-weight: 700; font-variant-numeric: tabular-nums; }
+  input[type=range] { -webkit-appearance: none; width: 100%; height: 3px; border-radius: 2px; background: var(--bd); outline: none; }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 12px; height: 12px; border-radius: 50%; background: var(--ac); cursor: pointer; }
+  input[type=range]::-moz-range-thumb { width: 12px; height: 12px; border-radius: 50%; background: var(--ac); cursor: pointer; border: none; }
+  .strat { border: 1px solid var(--bd); border-radius: 6px; padding: 8px 10px; transition: .15s; }
+  .strat.win { border-color: var(--g); background: rgba(52,211,153,0.04); }
+  .strat-head { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+  .strat-head .name { font-size: 12px; font-weight: 700; }
+  .tag { font-size: 9px; font-weight: 700; padding: 1px 6px; border-radius: 3px; text-transform: uppercase; letter-spacing: 0.4px; }
+  .tag-win { background: var(--g); color: #000; }
+  .mg { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; font-size: 11px; }
+  .mg .k { color: var(--t2); } .mg .v { font-weight: 600; text-align: right; font-variant-numeric: tabular-nums; }
+  .mg .v.hi { color: var(--ac); }
+  .note { font-size: 10.5px; color: var(--t2); margin-top: 6px; padding: 5px 8px; background: rgba(91,127,255,0.06); border-left: 2px solid var(--ac2); border-radius: 0 4px 4px 0; line-height: 1.5; }
+  .ch { position: relative; height: 240px; }
+  table { width: 100%; border-collapse: collapse; font-size: 11px; font-variant-numeric: tabular-nums; }
+  th, td { padding: 4px 8px; text-align: right; border-bottom: 1px solid var(--bd); }
+  th { color: var(--t2); font-weight: 600; text-transform: uppercase; font-size: 9px; letter-spacing: 0.5px; position: sticky; top: 0; background: var(--s1); }
+  td:first-child, th:first-child { text-align: left; }
+  tr:hover td { background: rgba(91,127,255,0.04); }
+  .b { display: inline-block; padding: 1px 5px; border-radius: 3px; font-size: 10px; font-weight: 600; }
+  .b-beats { background: rgba(52,211,153,0.12); color: var(--beats); }
+  .b-roformer { background: rgba(245,158,11,0.12); color: var(--roformer); }
+  .b-all { background: rgba(91,127,255,0.12); color: var(--all); }
+  .ok { color: var(--g); } .fail { color: var(--r); }
+  .tbl-wrap { max-height: 320px; overflow-y: auto; }
+  .inp { display: flex; align-items: center; gap: 6px; font-size: 11px; }
+  .inp label { color: var(--t2); white-space: nowrap; }
+  .inp input[type=number] { background: var(--bg); border: 1px solid var(--bd); color: var(--ac); font: 700 13px/1 'Inter', system-ui, sans-serif; font-variant-numeric: tabular-nums; padding: 5px 8px; border-radius: 4px; width: 90px; outline: none; transition: border-color .15s; }
+  .inp input[type=number]:focus { border-color: var(--ac); }
+  .inp input[type=number]::-webkit-inner-spin-button { opacity: 0.3; }
+  .tbl-wrap::-webkit-scrollbar { width: 4px; } .tbl-wrap::-webkit-scrollbar-thumb { background: var(--bd); border-radius: 2px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Preprocessing Benchmark</h1>
+  <span id="header-info">loading...</span>
+</header>
+
+<!-- Controls -->
+<div class="row">
+  <div class="card" style="max-width:200px">
+    <div class="card-title">GPU Cost</div>
+    <div class="inp"><label>$</label><input type="number" id="s-cost" min="0.01" max="100" step="0.001" value="0.115"><label>/GPU-h</label></div>
+  </div>
+  <div class="card" style="max-width:180px">
+    <div class="card-title">Budget</div>
+    <div class="inp"><label>$</label><input type="number" id="s-budget" min="1" max="1000000" step="1" value="100"></div>
+  </div>
+  <div class="card" style="max-width:260px">
+    <div class="card-title">Dataset</div>
+    <div class="sl">
+      <div class="sl-head"><span>Audio hours</span><span class="v" id="v-hours">1,000 h</span></div>
+      <input type="range" id="s-hours" min="100" max="50000" step="100" value="1000">
+    </div>
+  </div>
+  <div class="card" style="max-width:220px">
+    <div class="card-title">Deadline</div>
+    <div class="sl">
+      <div class="sl-head"><span>Wall-clock</span><span class="v" id="v-deadline">24 h</span></div>
+      <input type="range" id="s-deadline" min="1" max="168" step="1" value="24">
+    </div>
+  </div>
+</div>
+
+<!-- Strategy comparison -->
+<div class="row">
+  <div class="card">
+    <div class="card-title">Strategy A — "all" mode (best across all GPUs)</div>
+    <div class="strat" id="strat-all">
+      <div class="strat-head"><span class="name">Single machine type</span><span id="tag-all"></span></div>
+      <div class="mg" id="metrics-all"></div>
+    </div>
+    <div class="note" id="tip-all"></div>
+  </div>
+  <div class="card">
+    <div class="card-title">Strategy B — beats + roformer-asr separate (best across all GPUs)</div>
+    <div class="strat" id="strat-sep">
+      <div class="strat-head"><span class="name">Split across pools</span><span id="tag-sep"></span></div>
+      <div class="mg" id="metrics-sep"></div>
+    </div>
+    <div class="note" id="tip-sep"></div>
+  </div>
+</div>
+
+<!-- GPU comparison -->
+<div class="row">
+  <div class="card"><div class="card-title">GPU Comparison — Best Cost per Audio Hour ($)</div><div class="ch"><canvas id="chart-gpu-cmp"></canvas></div></div>
+  <div class="card"><div class="card-title">GPU Comparison — Best Throughput (audio-h / GPU-h)</div><div class="ch"><canvas id="chart-gpu-tp"></canvas></div></div>
+</div>
+
+<!-- Per-batch charts -->
+<div class="row">
+  <div class="card"><div class="card-title">Time per Audio Hour (s) — all GPUs</div><div class="ch"><canvas id="chart-time"></canvas></div></div>
+  <div class="card"><div class="card-title">Cost per Audio Hour ($) — all GPUs</div><div class="ch"><canvas id="chart-cost"></canvas></div></div>
+</div>
+<div class="row">
+  <div class="card"><div class="card-title">Throughput (audio-h / GPU-h) — all GPUs</div><div class="ch"><canvas id="chart-throughput"></canvas></div></div>
+  <div class="card"><div class="card-title">Processable Within Budget (audio-h)</div><div class="ch"><canvas id="chart-budget"></canvas></div></div>
+</div>
+<div class="row">
+  <div class="card"><div class="card-title">Machines Needed (best config)</div><div class="ch"><canvas id="chart-machines"></canvas></div></div>
+  <div class="card"><div class="card-title">Cost Breakdown (best config)</div><div class="ch"><canvas id="chart-breakdown"></canvas></div></div>
+</div>
+
+<!-- Table -->
+<div class="row">
+  <div class="card" style="flex:1">
+    <div class="card-title">Raw Data</div>
+    <div class="tbl-wrap">
+      <table id="data-table">
+        <thead><tr><th>GPU</th><th>Mode</th><th>BS</th><th>Time/h (s)</th><th>Total (s)</th><th>OK</th><th>$/audio-h</th><th>Throughput</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+const DATA_URL = 'bench_preprocessing_on_NVIDIA_GeForce_RTX_3090.json';
+let benchData = [], charts = {};
+let gpuNames = [], batchSizes = [], modes = [];
+
+const el = id => document.getElementById(id);
+const sls = { cost: el('s-cost'), budget: el('s-budget'), hours: el('s-hours'), deadline: el('s-deadline') };
+const vals = { hours: el('v-hours'), deadline: el('v-deadline') };
+
+function P() { return { cost: +sls.cost.value || 0.115, budget: +sls.budget.value || 100, hours: +sls.hours.value, deadline: +sls.deadline.value }; }
+function upd() { const p = P(); vals.hours.textContent = p.hours.toLocaleString() + ' h'; vals.deadline.textContent = p.deadline + ' h'; }
+[sls.hours, sls.deadline].forEach(s => s.addEventListener('input', () => { upd(); refresh(); }));
+[sls.cost, sls.budget].forEach(s => s.addEventListener('input', () => { refresh(); }));
+
+function shortGpu(g) { return g.replace(/NVIDIA_GeForce_/g, '').replace(/_/g, ' '); }
+function getRow(gpu, mode, bs) { return benchData.find(r => r.gpu === gpu && r.mode === mode && r.batch_size === bs); }
+function cpa(r, c) { return (r.avg_time_per_hour / 3600) * c; }
+function tp(r) { return 3600 / r.avg_time_per_hour; }
+
+// Colors: per-GPU base, per-mode variant
+const GPU_BASE = ['#5b7fff', '#f59e0b', '#34d399', '#f87171', '#a78bfa', '#fb923c', '#38bdf8', '#e879f9'];
+const MODE_ALPHA = { beats: 'cc', 'roformer-asr': '99', all: 'ff' };
+const MODE_DASH = { beats: [4, 2], 'roformer-asr': [8, 4], all: [] };
+const MC = { beats: '#34d399', 'roformer-asr': '#f59e0b', all: '#5b7fff' };
+
+function gpuColor(gi) { return GPU_BASE[gi % GPU_BASE.length]; }
+
+function buildTable() {
+  const p = P(), tb = document.querySelector('#data-table tbody');
+  tb.innerHTML = '';
+  benchData.forEach(r => {
+    const cls = r.mode === 'beats' ? 'beats' : r.mode === 'roformer-asr' ? 'roformer' : 'all';
+    tb.innerHTML += `<tr><td style="font-size:10px">${shortGpu(r.gpu)}</td><td><span class="b b-${cls}">${r.mode}</span></td><td>${r.batch_size}</td><td>${r.avg_time_per_hour.toFixed(2)}</td><td>${r.total_time.toFixed(2)}</td><td class="${r.ok===r.files?'ok':'fail'}">${r.ok}/${r.files}</td><td>$${cpa(r,p.cost).toFixed(4)}</td><td>${tp(r).toFixed(1)}</td></tr>`;
+  });
+}
+
+Chart.defaults.color = '#7a8299';
+Chart.defaults.borderColor = 'rgba(255,255,255,0.04)';
+Chart.defaults.font.size = 10;
+const cOpt = { responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { boxWidth: 10, padding: 6, font: { size: 9 } } } } };
+
+function buildCharts() {
+  const p = P();
+
+  // Per-batch line charts: one dataset per gpu:mode combo
+  function makeDatasets(valueFn) {
+    const ds = [];
+    gpuNames.forEach((gpu, gi) => {
+      modes.forEach(m => {
+        const gpuBs = batchSizes.filter(bs => getRow(gpu, m, bs));
+        if (!gpuBs.length) return;
+        ds.push({
+          label: shortGpu(gpu) + ' ' + m,
+          data: batchSizes.map(bs => { const r = getRow(gpu, m, bs); return r ? valueFn(r, p) : null; }),
+          borderColor: gpuColor(gi) + MODE_ALPHA[m],
+          backgroundColor: gpuColor(gi) + '18',
+          borderDash: MODE_DASH[m],
+          tension: .3, pointRadius: 3, borderWidth: 1.5, fill: false, spanGaps: false
+        });
+      });
+    });
+    return ds;
+  }
+
+  charts.time = new Chart(el('chart-time'), {
+    type: 'line', data: { labels: batchSizes, datasets: makeDatasets(r => r.avg_time_per_hour) },
+    options: { ...cOpt, scales: { x: { title: { display: true, text: 'Batch' } }, y: { title: { display: true, text: 's' }, beginAtZero: true } } }
+  });
+  charts.throughput = new Chart(el('chart-throughput'), {
+    type: 'line', data: { labels: batchSizes, datasets: makeDatasets(r => tp(r)) },
+    options: { ...cOpt, scales: { x: { title: { display: true, text: 'Batch' } }, y: { title: { display: true, text: 'ah/GPU-h' }, beginAtZero: true } } }
+  });
+  charts.cost = new Chart(el('chart-cost'), {
+    type: 'bar', data: { labels: batchSizes, datasets: makeDatasets((r, p) => cpa(r, p.cost)).map(ds => ({ ...ds, fill: undefined, borderDash: undefined, type: 'bar', backgroundColor: ds.borderColor, borderWidth: 1 })) },
+    options: { ...cOpt, scales: { x: { title: { display: true, text: 'Batch' } }, y: { title: { display: true, text: '$' }, beginAtZero: true } } }
+  });
+
+  charts.budget = new Chart(el('chart-budget'), { type: 'bar', data: { labels: batchSizes, datasets: [] }, options: { ...cOpt, scales: { x: { title: { display: true, text: 'Batch' } }, y: { title: { display: true, text: 'audio-h' }, beginAtZero: true } } } });
+  charts.machines = new Chart(el('chart-machines'), { type: 'bar', data: { labels: [], datasets: [] }, options: { ...cOpt, indexAxis: 'y', plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true } } } });
+  charts.breakdown = new Chart(el('chart-breakdown'), { type: 'doughnut', data: { labels: [], datasets: [{ data: [], backgroundColor: [] }] }, options: { ...cOpt, plugins: { legend: { position: 'right', labels: { boxWidth: 8, padding: 6, font: { size: 10 } } } } } });
+
+  // GPU comparison charts
+  charts.gpuCmp = new Chart(el('chart-gpu-cmp'), { type: 'bar', data: { labels: [], datasets: [] }, options: { ...cOpt, indexAxis: 'y', scales: { x: { title: { display: true, text: '$ / audio-h' }, beginAtZero: true } } } });
+  charts.gpuTp = new Chart(el('chart-gpu-tp'), { type: 'bar', data: { labels: [], datasets: [] }, options: { ...cOpt, indexAxis: 'y', scales: { x: { title: { display: true, text: 'audio-h / GPU-h' }, beginAtZero: true } } } });
+}
+
+// Find best "all" mode across ALL gpus
+function globalBestAll() {
+  let best = null;
+  gpuNames.forEach(gpu => {
+    batchSizes.forEach(bs => {
+      const r = getRow(gpu, 'all', bs);
+      if (!r || r.ok !== r.files) return;
+      if (!best || r.avg_time_per_hour < best.avg_time_per_hour) best = r;
+    });
+  });
+  return best;
+}
+
+// Find best separate (beats+roformer) across ALL gpus (can mix GPUs)
+function globalBestSep() {
+  let bestB = null, bestR = null, bestSum = Infinity;
+  gpuNames.forEach(gB => {
+    batchSizes.forEach(bbs => {
+      const rb = getRow(gB, 'beats', bbs);
+      if (!rb || rb.ok !== rb.files) return;
+      gpuNames.forEach(gR => {
+        batchSizes.forEach(rbs => {
+          const rr = getRow(gR, 'roformer-asr', rbs);
+          if (!rr || rr.ok !== rr.files) return;
+          const s = rb.avg_time_per_hour + rr.avg_time_per_hour;
+          if (s < bestSum) { bestSum = s; bestB = rb; bestR = rr; }
+        });
+      });
+    });
+  });
+  return { beats: bestB, roformer: bestR };
+}
+
+// Per-GPU best configs for comparison charts
+function perGpuBest(gpu) {
+  let bestAll = null, bestB = null, bestR = null;
+  batchSizes.forEach(bs => {
+    const ra = getRow(gpu, 'all', bs);
+    if (ra && ra.ok === ra.files && (!bestAll || ra.avg_time_per_hour < bestAll.avg_time_per_hour)) bestAll = ra;
+    const rb = getRow(gpu, 'beats', bs);
+    if (rb && rb.ok === rb.files && (!bestB || rb.avg_time_per_hour < bestB.avg_time_per_hour)) bestB = rb;
+    const rr = getRow(gpu, 'roformer-asr', bs);
+    if (rr && rr.ok === rr.files && (!bestR || rr.avg_time_per_hour < bestR.avg_time_per_hour)) bestR = rr;
+  });
+  return { all: bestAll, beats: bestB, roformer: bestR };
+}
+
+function refresh() {
+  const p = P(), gpuH = p.budget / p.cost, ah = p.hours;
+  const bAll = globalBestAll(), sep = globalBestSep();
+  if (!bAll || !sep.beats || !sep.roformer) return;
+
+  // Strategy A
+  const aS = bAll.avg_time_per_hour, aBs = bAll.batch_size, aGpu = bAll.gpu;
+  const aG = aS/3600, aC = aG*p.cost, aT = ah*aC, aTG = ah*aG, aP = gpuH/aG, aM = Math.ceil(aTG/p.deadline);
+
+  // Strategy B
+  const bS = sep.beats.avg_time_per_hour, rS = sep.roformer.avg_time_per_hour;
+  const bBs = sep.beats.batch_size, rBs = sep.roformer.batch_size;
+  const bGpu = sep.beats.gpu, rGpu = sep.roformer.gpu;
+  const bG = bS/3600, rG = rS/3600, sC = (bG+rG)*p.cost, sT = ah*sC, sTG = ah*(bG+rG), sP = gpuH/(bG+rG);
+  const bM = Math.ceil(ah*bG/p.deadline), rM = Math.ceil(ah*rG/p.deadline), sM = bM+rM;
+  const win = aT <= sT;
+
+  el('strat-all').className = 'strat' + (win ? ' win' : '');
+  el('strat-sep').className = 'strat' + (!win ? ' win' : '');
+  el('tag-all').innerHTML = win ? '<span class="tag tag-win">cheaper</span>' : '';
+  el('tag-sep').innerHTML = !win ? '<span class="tag tag-win">cheaper</span>' : '';
+
+  el('metrics-all').innerHTML = `
+    <span class="k">GPU</span><span class="v">${shortGpu(aGpu)}</span>
+    <span class="k">Best batch</span><span class="v">${aBs}</span>
+    <span class="k">Cost/audio-h</span><span class="v">$${aC.toFixed(4)}</span>
+    <span class="k">Total (${ah.toLocaleString()} h)</span><span class="v hi">$${aT.toFixed(2)}</span>
+    <span class="k">GPU-hours</span><span class="v">${aTG.toFixed(1)}</span>
+    <span class="k">Within budget</span><span class="v">${Math.floor(aP).toLocaleString()} ah</span>
+    <span class="k">Machines (${p.deadline}h)</span><span class="v">${aM}</span>
+    <span class="k">Speed</span><span class="v">${aS.toFixed(1)} s/ah</span>`;
+
+  const sameGpu = bGpu === rGpu;
+  el('metrics-sep').innerHTML = `
+    <span class="k">GPU beats</span><span class="v">${shortGpu(bGpu)} (bs=${bBs})</span>
+    <span class="k">GPU roformer-asr</span><span class="v">${shortGpu(rGpu)} (bs=${rBs})</span>
+    <span class="k">Cost/audio-h</span><span class="v">$${sC.toFixed(4)}</span>
+    <span class="k">Total (${ah.toLocaleString()} h)</span><span class="v hi">$${sT.toFixed(2)}</span>
+    <span class="k">GPU-hours</span><span class="v">${sTG.toFixed(1)}</span>
+    <span class="k">Within budget</span><span class="v">${Math.floor(sP).toLocaleString()} ah</span>
+    <span class="k">Machines (${p.deadline}h)</span><span class="v">${sM} (${bM}b+${rM}r)</span>
+    <span class="k">Speed (b/r)</span><span class="v">${bS.toFixed(1)}/${rS.toFixed(1)} s/ah</span>`;
+
+  const pct = (Math.abs(aT-sT)/Math.max(aT,sT)*100).toFixed(1);
+  if (win) {
+    el('tip-all').innerHTML = `<b>"all" on ${shortGpu(aGpu)} is ${pct}% cheaper</b> (bs=${aBs}). Beats (${bS.toFixed(1)}s) is ${(rS/bS).toFixed(0)}x faster than roformer (${rS.toFixed(1)}s) — pipeline overlap saves GPU-hours.`;
+    el('tip-sep').innerHTML = `Costs more due to idle beats GPU. But ${sM} machines vs ${aM} — better wall-clock if GPUs are available.`;
+  } else {
+    el('tip-sep').innerHTML = `<b>Separate is ${pct}% cheaper</b> (beats: ${shortGpu(bGpu)} bs=${bBs}, roformer: ${shortGpu(rGpu)} bs=${rBs}).`;
+    el('tip-all').innerHTML = `Simpler (one job type) but costs more. Best: ${shortGpu(aGpu)} bs=${aBs}.`;
+  }
+
+  // GPU comparison charts
+  const gpuLabels = gpuNames.map(shortGpu);
+  const perGpu = gpuNames.map(g => perGpuBest(g));
+
+  // Cost comparison: 3 bars per GPU (all, beats, roformer)
+  charts.gpuCmp.data = {
+    labels: gpuLabels,
+    datasets: [
+      { label: 'all', data: perGpu.map(pg => pg.all ? cpa(pg.all, p.cost) : null), backgroundColor: MC.all + '99', borderColor: MC.all, borderWidth: 1 },
+      { label: 'beats', data: perGpu.map(pg => pg.beats ? cpa(pg.beats, p.cost) : null), backgroundColor: MC.beats + '99', borderColor: MC.beats, borderWidth: 1 },
+      { label: 'roformer-asr', data: perGpu.map(pg => pg.roformer ? cpa(pg.roformer, p.cost) : null), backgroundColor: MC['roformer-asr'] + '99', borderColor: MC['roformer-asr'], borderWidth: 1 },
+    ]
+  };
+  charts.gpuCmp.update('none');
+
+  charts.gpuTp.data = {
+    labels: gpuLabels,
+    datasets: [
+      { label: 'all', data: perGpu.map(pg => pg.all ? tp(pg.all) : null), backgroundColor: MC.all + '99', borderColor: MC.all, borderWidth: 1 },
+      { label: 'beats', data: perGpu.map(pg => pg.beats ? tp(pg.beats) : null), backgroundColor: MC.beats + '99', borderColor: MC.beats, borderWidth: 1 },
+      { label: 'roformer-asr', data: perGpu.map(pg => pg.roformer ? tp(pg.roformer) : null), backgroundColor: MC['roformer-asr'] + '99', borderColor: MC['roformer-asr'], borderWidth: 1 },
+    ]
+  };
+  charts.gpuTp.update('none');
+
+  // Per-batch cost chart update
+  const costDs = [];
+  gpuNames.forEach((gpu, gi) => {
+    modes.forEach(m => {
+      const d = batchSizes.map(bs => { const r = getRow(gpu, m, bs); return r ? cpa(r, p.cost) : null; });
+      if (d.every(v => v === null)) return;
+      costDs.push({ label: shortGpu(gpu)+' '+m, data: d, backgroundColor: gpuColor(gi) + MODE_ALPHA[m], borderColor: gpuColor(gi), borderWidth: 1 });
+    });
+  });
+  charts.cost.data.labels = batchSizes;
+  charts.cost.data.datasets = costDs;
+  charts.cost.update('none');
+
+  // Per-batch time chart update
+  const timeDs = [];
+  gpuNames.forEach((gpu, gi) => {
+    modes.forEach(m => {
+      const d = batchSizes.map(bs => { const r = getRow(gpu, m, bs); return r ? r.avg_time_per_hour : null; });
+      if (d.every(v => v === null)) return;
+      timeDs.push({ label: shortGpu(gpu)+' '+m, data: d, borderColor: gpuColor(gi) + MODE_ALPHA[m], backgroundColor: gpuColor(gi)+'18', borderDash: MODE_DASH[m], tension: .3, pointRadius: 3, borderWidth: 1.5, fill: false });
+    });
+  });
+  charts.time.data.labels = batchSizes;
+  charts.time.data.datasets = timeDs;
+  charts.time.update('none');
+
+  // Per-batch throughput chart update
+  const tpDs = [];
+  gpuNames.forEach((gpu, gi) => {
+    modes.forEach(m => {
+      const d = batchSizes.map(bs => { const r = getRow(gpu, m, bs); return r ? tp(r) : null; });
+      if (d.every(v => v === null)) return;
+      tpDs.push({ label: shortGpu(gpu)+' '+m, data: d, borderColor: gpuColor(gi) + MODE_ALPHA[m], backgroundColor: gpuColor(gi)+'18', borderDash: MODE_DASH[m], tension: .3, pointRadius: 3, borderWidth: 1.5, fill: false });
+    });
+  });
+  charts.throughput.data.labels = batchSizes;
+  charts.throughput.data.datasets = tpDs;
+  charts.throughput.update('none');
+
+  // Budget chart: per GPU, best "all" and best "separate"
+  const budgetDs = [];
+  gpuNames.forEach((gpu, gi) => {
+    const pg = perGpuBest(gpu);
+    if (pg.all) {
+      budgetDs.push({ label: shortGpu(gpu)+' all', data: batchSizes.map(bs => { const r = getRow(gpu,'all',bs); return r ? gpuH/(r.avg_time_per_hour/3600) : null; }), backgroundColor: gpuColor(gi)+'99', borderColor: gpuColor(gi), borderWidth: 1 });
+    }
+    if (pg.beats && pg.roformer) {
+      budgetDs.push({ label: shortGpu(gpu)+' sep', data: batchSizes.map(bs => { const rb = getRow(gpu,'beats',bs), rr = getRow(gpu,'roformer-asr',bs); return (rb&&rr) ? gpuH/(rb.avg_time_per_hour/3600+rr.avg_time_per_hour/3600) : null; }), backgroundColor: gpuColor(gi)+'55', borderColor: gpuColor(gi), borderWidth: 1, borderDash: [4,2] });
+    }
+  });
+  charts.budget.data.labels = batchSizes;
+  charts.budget.data.datasets = budgetDs;
+  charts.budget.update('none');
+
+  // Machines chart: best configs
+  charts.machines.data = {
+    labels: [`all (${shortGpu(aGpu)})`, `sep beats (${shortGpu(bGpu)})`, `sep roformer (${shortGpu(rGpu)})`, 'sep total'],
+    datasets: [{ data: [aM, bM, rM, sM], backgroundColor: [MC.all+'bb', MC.beats+'bb', MC['roformer-asr']+'bb', '#555b'], borderWidth: 0 }]
+  };
+  charts.machines.update('none');
+
+  // Breakdown
+  const bCost = ah*bG*p.cost, rCost = ah*rG*p.cost;
+  charts.breakdown.data = {
+    labels: [`all (${shortGpu(aGpu)}): $${aT.toFixed(0)}`, `beats (${shortGpu(bGpu)}): $${bCost.toFixed(0)}`, `roformer (${shortGpu(rGpu)}): $${rCost.toFixed(0)}`],
+    datasets: [{ data: [aT, bCost, rCost], backgroundColor: [MC.all+'bb', MC.beats+'bb', MC['roformer-asr']+'bb'], borderWidth: 0 }]
+  };
+  charts.breakdown.update('none');
+
+  buildTable();
+}
+
+fetch(DATA_URL).then(r => r.json()).then(d => {
+  benchData = d.results;
+  gpuNames = [...new Set(benchData.map(r => r.gpu))];
+  batchSizes = [...new Set(benchData.map(r => r.batch_size))].sort((a,b) => a-b);
+  modes = [...new Set(benchData.map(r => r.mode))];
+  el('header-info').innerHTML = gpuNames.map(shortGpu).join(' / ') + ' &middot; ' + modes.join(' / ') + ' &middot; batch sizes: ' + batchSizes.join(', ');
+  upd(); buildCharts(); refresh();
+}).catch(e => { document.body.innerHTML += `<p style="color:var(--r);padding:12px">Load error: ${e.message}</p>`; });
+</script>
+</body>
+</html>

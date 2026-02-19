@@ -1,0 +1,46 @@
+{
+    "components": {
+      "mp3": {
+        "pattern": "*.mp3",
+        "multiple": false,
+        "description": ""
+      },
+      "info": {
+        "pattern": "*.json",
+        "multiple": false,
+        "description": ""
+      },
+      "lyrics": {
+        "pattern": "*_lyrics.json",
+        "multiple": false,
+        "description": ""
+      },
+      "beats": {
+        "pattern": "*_beats.json",
+        "multiple": false,
+        "description": ""
+      },
+      "pitch": {
+        "pattern": "*_pitch.pt",
+        "multiple": false,
+        "description": ""
+      },
+      "vocal": {
+        "pattern": "*_voc.opus",
+        "multiple": false,
+        "description": ""
+      },
+      "vocal_dereverb": {
+        "pattern": "*_voc_der.opus",
+        "multiple": false,
+        "description": ""
+      },
+      "music": {
+        "pattern": "*_music.opus",
+        "multiple": false,
+        "description": ""
+      }
+    },
+    "structure": {},
+    "sync": {}
+  }
