@@ -7,7 +7,7 @@ Modes:
     roformer-asr – Windowed Roformer → vocal/music opus 160 kbps → Parakeet ASR
     all          – both (sequentially)
 
-Output per file: _voc.opus, _music.opus, .json
+Output per file: _voc.opus, _music.opus, _beats.json, _lyrics.json
 
 Usage:
     python audio_pipeline.py --mode beats
@@ -467,18 +467,22 @@ def process_file(
             traceback.print_exc()
             result.error = (result.error or "") + f" separation/asr: {exc}"
 
-    # ── Save JSON (merge with existing if partial mode) ───────────────
-    json_path = base + ".json"
-    updates: Dict[str, Any] = {}
+    # ── Save JSON files ─────────────────────────────────────────────
     if run_beats:
-        updates["beats"] = result.beats
-        updates["downbeats"] = result.downbeats
+        beats_path = base + "_beats.json"
+        save_json_locked(beats_path, {
+            "beats": result.beats,
+            "downbeats": result.downbeats,
+        })
+        logger.info(f"[{stem}] Beats saved → {beats_path}")
     if run_sep:
-        updates["text"] = result.text
-        updates["segments"] = result.segments
-        updates["words"] = result.words
-    save_json_locked(json_path, updates)
-    logger.info(f"[{stem}] JSON saved → {json_path}")
+        lyrics_path = base + "_lyrics.json"
+        save_json_locked(lyrics_path, {
+            "text": result.text,
+            "segments": result.segments,
+            "words": result.words,
+        })
+        logger.info(f"[{stem}] Lyrics saved → {lyrics_path}")
 
     return result
 
@@ -559,8 +563,8 @@ def run_pipeline(
                     r = FileResult(input_file=path, beats=beats, downbeats=downbeats)
                     results.append(r)
 
-                    json_path = base + ".json"
-                    save_json_locked(json_path, {
+                    beats_path = base + "_beats.json"
+                    save_json_locked(beats_path, {
                         "beats": beats,
                         "downbeats": downbeats,
                     })
@@ -630,8 +634,8 @@ def run_pipeline(
                                    words=asr_out["words"])
                     results.append(r)
 
-                    json_path = base + ".json"
-                    save_json_locked(json_path, {
+                    lyrics_path = base + "_lyrics.json"
+                    save_json_locked(lyrics_path, {
                         "text": asr_out["text"],
                         "segments": asr_out["segments"],
                         "words": asr_out["words"],
