@@ -153,6 +153,9 @@ def load_beat_model(device: str):
 
 # ── Windowed Roformer ──────────────────────────────────────────────────────
 def load_roformer_model(device: str):
+    _roformer_dir = os.path.join(os.path.dirname(__file__), "windowed-roformer")
+    if _roformer_dir not in sys.path:
+        sys.path.insert(0, _roformer_dir)
     from model import MelBandRoformerWSA
     # Download checkpoint if needed
     if not os.path.exists(ROFORMER_CKPT_NAME):
