@@ -10,19 +10,19 @@ Dataset schema components produced (see scheme.json):
 
 Usage:
     python process_remote_streaming.py
-    python process_remote_streaming.py --mode beats
+    python process_remote_streaming.py --server https://1.2.3.4:8085/ --dataset /path/to/dataset
+    python process_remote_streaming.py --server https://1.2.3.4 --port 9090 --dataset /data/Music
+    python process_remote_streaming.py --mode beats --batch-size 8
     python process_remote_streaming.py --mode roformer-asr
-
-Configuration:
-    Edit SERVER_URL, USERNAME, PASSWORD below to match your remote server.
-    See setup_remote_server.sh for how to set up the server side.
 """
 
+import argparse
 import json
 import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
 
 import torch
 
@@ -43,43 +43,59 @@ from blackbird.streaming import StreamingPipeline
 
 
 # ---------------------------------------------------------------------------
-# Configuration — edit these to match your remote server
+# Defaults
 # ---------------------------------------------------------------------------
 
-SERVER_URL = "https://188.120.253.126:8085/"   # remote WebDAV URL
-USERNAME = "blackbird"
-PASSWORD = "dataset"
+DEFAULT_SERVER_URL = "https://188.120.253.126:8085/"
+DEFAULT_USERNAME = "blackbird"
+DEFAULT_PASSWORD = "dataset"
+DEFAULT_SSH_KEY = "dev-233158-kiberchaika.pem"
+DEFAULT_DATASET_PATH = "/home/k4/Datasets/Music_Part1.01_Test"
+DEFAULT_MODE = "all"
+DEFAULT_BATCH_SIZE = 4
+DEFAULT_PREFETCH_WORKERS = 4
+DEFAULT_UPLOAD_WORKERS = 4
+DEFAULT_WORK_DIR = "/tmp/blackbird_processing"
 
-# SSH settings for remote reindex
-SSH_KEY = "/home/k4/Python/windowed-roformer/dev-233158-kiberchaika.pem"
-SSH_HOST = "188.120.253.126"
-REMOTE_DATASET_PATH = "/home/k4/Datasets/Music_Part1.01_Test"
-
-# Which component to stream (must exist in dataset schema)
 COMPONENTS = ["mp3"]
 
-# Processing mode: "beats", "roformer-asr", or "all"
-MODE = "all"
 
-# Processing settings
-BATCH_SIZE = 4           # items per take()
-QUEUE_SIZE = BATCH_SIZE * 8           # prefetch buffer
-PREFETCH_WORKERS = 4     # download threads
-UPLOAD_WORKERS = 4       # upload threads
-WORK_DIR = "/tmp/blackbird_processing"
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Stream MP3 from Blackbird WebDAV, process with audio pipeline, upload results")
+    p.add_argument("--server", default=DEFAULT_SERVER_URL,
+                   help=f"WebDAV server URL (default: {DEFAULT_SERVER_URL})")
+    p.add_argument("--port", type=int, default=None,
+                   help="Override server port (replaces port in --server URL)")
+    p.add_argument("--username", default=DEFAULT_USERNAME,
+                   help=f"WebDAV username (default: {DEFAULT_USERNAME})")
+    p.add_argument("--password", default=DEFAULT_PASSWORD,
+                   help=f"WebDAV password (default: {DEFAULT_PASSWORD})")
+    p.add_argument("--ssh-key", default=DEFAULT_SSH_KEY,
+                   help=f"SSH key for remote reindex (default: {DEFAULT_SSH_KEY})")
+    p.add_argument("--dataset", default=DEFAULT_DATASET_PATH,
+                   help=f"Remote dataset path (default: {DEFAULT_DATASET_PATH})")
+    p.add_argument("--mode", choices=["beats", "roformer-asr", "all"],
+                   default=DEFAULT_MODE,
+                   help=f"Processing mode (default: {DEFAULT_MODE})")
+    p.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
+                   help=f"Items per take() batch (default: {DEFAULT_BATCH_SIZE})")
+    p.add_argument("--work-dir", default=DEFAULT_WORK_DIR,
+                   help=f"Local work directory (default: {DEFAULT_WORK_DIR})")
+    return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def remote_reindex() -> None:
+def remote_reindex(ssh_key: str, ssh_host: str, dataset_path: str) -> None:
     """SSH into the server and run blackbird reindex, wait for completion."""
     cmd = [
-        "ssh", "-i", SSH_KEY,
+        "ssh", "-i", ssh_key,
         "-o", "StrictHostKeyChecking=no",
-        f"root@{SSH_HOST}",
-        f"source /home/k4/.venv/bin/activate && blackbird reindex '{REMOTE_DATASET_PATH}'",
+        f"root@{ssh_host}",
+        f"source /home/k4/.venv/bin/activate && blackbird reindex '{dataset_path}'",
     ]
     print(f"Running remote reindex: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -129,7 +145,20 @@ def submit_and_log(pipeline, item, result_path: Path, remote_name: str,
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    mode = MODE
+    args = parse_args()
+
+    # Build server URL with optional port override
+    server_url = args.server
+    if args.port is not None:
+        parsed = urlparse(server_url)
+        server_url = urlunparse(parsed._replace(netloc=f"{parsed.hostname}:{args.port}"))
+
+    # Extract SSH host from server URL
+    ssh_host = urlparse(server_url).hostname
+
+    mode = args.mode
+    batch_size = args.batch_size
+    queue_size = batch_size * 4
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Step 0: load models
@@ -144,24 +173,25 @@ def main() -> None:
     logger.info(f"Models loaded in {time.perf_counter() - t_load:.1f}s")
 
     # Step 1: reindex on the server so we get a fresh index
-    remote_reindex()
+    remote_reindex(args.ssh_key, ssh_host, args.dataset)
 
     # Step 2: connect and stream with updated index
-    print(f"Connecting to {SERVER_URL} ...")
+    print(f"Connecting to {server_url} ...")
     print(f"Components: {COMPONENTS}")
     print(f"Mode:       {mode}")
-    print(f"Work dir:   {WORK_DIR}")
+    print(f"Dataset:    {args.dataset}")
+    print(f"Work dir:   {args.work_dir}")
     print()
 
     pipeline = StreamingPipeline(
-        url=SERVER_URL,
-        username=USERNAME,
-        password=PASSWORD,
+        url=server_url,
+        username=args.username,
+        password=args.password,
         components=COMPONENTS,
-        queue_size=QUEUE_SIZE,
-        prefetch_workers=PREFETCH_WORKERS,
-        upload_workers=UPLOAD_WORKERS,
-        work_dir=WORK_DIR,
+        queue_size=queue_size,
+        prefetch_workers=DEFAULT_PREFETCH_WORKERS,
+        upload_workers=DEFAULT_UPLOAD_WORKERS,
+        work_dir=args.work_dir,
     )
 
     processed = 0
@@ -181,7 +211,7 @@ def main() -> None:
         while True:
             # Measure download (take) time
             t0 = time.time()
-            items = pipeline.take(count=BATCH_SIZE)
+            items = pipeline.take(count=batch_size)
             dl_time = time.time() - t0
 
             if not items:
