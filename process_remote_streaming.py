@@ -262,7 +262,7 @@ def main() -> None:
                         beats_path = parent / f"{stem}_beats.json"
                         beats_path.write_text(json.dumps(beats_data, indent=2))
                         submit_and_log(pipeline, item, beats_path,
-                                       f"{track}_beats.json", stats)
+                                       f"{stem}_beats.json", stats)
 
                     # 2) Vocal separation -> _voc.opus + _music.opus
                     #    ASR on vocals  -> _lyrics.json
@@ -283,9 +283,9 @@ def main() -> None:
                         logger.info(f"[{track}] Opus saved [{ms_opus:.0f}ms]")
 
                         submit_and_log(pipeline, item, vocal_path,
-                                       f"{track}_voc.opus", stats)
+                                       f"{stem}_voc.opus", stats)
                         submit_and_log(pipeline, item, music_path,
-                                       f"{track}_music.opus", stats)
+                                       f"{stem}_music.opus", stats)
 
                         # ASR transcription
                         t3 = time.perf_counter()
@@ -302,7 +302,7 @@ def main() -> None:
                         lyrics_path.write_text(
                             json.dumps(lyrics_data, ensure_ascii=False, indent=2))
                         submit_and_log(pipeline, item, lyrics_path,
-                                       f"{track}_lyrics.json", stats)
+                                       f"{stem}_lyrics.json", stats)
 
                     elapsed = time.perf_counter() - file_start
                     dur_hours = dur / 3600
