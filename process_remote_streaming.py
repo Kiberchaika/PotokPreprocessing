@@ -5,8 +5,8 @@ with the audio pipeline (beats, vocal separation, ASR), and upload results.
 Dataset schema components produced (see scheme.json):
   - beats    (*_beats.json)   – beat & downbeat timestamps
   - lyrics   (*_lyrics.json)  – ASR transcription with word timestamps
-  - vocal    (*_voc.opus)     – isolated vocals, Opus 160 kbps
-  - music    (*_music.opus)   – accompaniment, Opus 160 kbps
+  - vocal    (*_voc.opus)     – isolated vocals
+  - music    (*_music.opus)   – accompaniment
 
 Usage:
     python process_remote_streaming.py
@@ -35,6 +35,8 @@ from audio_pipeline import (
     save_opus,
     transcribe_audio,
     logger,
+    OPUS_BITRATE_VOCAL,
+    OPUS_BITRATE_MUSIC,
 )
 
 from blackbird.streaming import StreamingPipeline
@@ -238,8 +240,8 @@ def main() -> None:
                         t2 = time.perf_counter()
                         vocal_path = parent / f"{stem}_voc.opus"
                         music_path = parent / f"{stem}_music.opus"
-                        save_opus(vocals_np, str(vocal_path))
-                        save_opus(music_np, str(music_path))
+                        save_opus(vocals_np, str(vocal_path), bitrate=OPUS_BITRATE_VOCAL)
+                        save_opus(music_np, str(music_path), bitrate=OPUS_BITRATE_MUSIC)
                         ms_opus = (time.perf_counter() - t2) * 1000
                         logger.info(f"[{track}] Opus saved [{ms_opus:.0f}ms]")
 

@@ -90,5 +90,5 @@ MP3-датасет (WebDAV / локально)
 
 - **`<name>_beats.json`** — биты и даунбиты (секунды)
 - **`<name>_lyrics.json`** — ASR-транскрипция с сегментами и word-level timestamps
-- **`<name>_voc.opus`** — вокальная дорожка (Opus 160 kbps)
-- **`<name>_music.opus`** — музыкальная дорожка (Opus 160 kbps)
+- **`<name>_voc.opus`** — вокальная дорожка (Opus 96 kbps)
+- **`<name>_music.opus`** — музыкальная дорожка (Opus 128 kbps)

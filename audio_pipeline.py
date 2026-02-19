@@ -75,7 +75,8 @@ ASR_BACKEND = "inductor"         # inductor recommended for NeMo
 USE_FP16 = True
 ASR_MODEL_NAME = "nvidia/parakeet-tdt-0.6b-v3"
 ASR_TARGET_SR = 16_000
-OPUS_BITRATE = "160k"
+OPUS_BITRATE_VOCAL = "96k"
+OPUS_BITRATE_MUSIC = "128k"
 
 ROFORMER_CKPT_NAME = "mbr-win10-sink8.ckpt"
 ROFORMER_CKPT_URL = (
@@ -339,7 +340,8 @@ def separate_vocals(
     return vocals_np, music_np
 
 
-def save_opus(audio_np: np.ndarray, path: str, sample_rate: int = 44_100):
+def save_opus(audio_np: np.ndarray, path: str, sample_rate: int = 44_100,
+              bitrate: str = OPUS_BITRATE_VOCAL):
     """Save numpy audio array as Opus via ffmpeg."""
     # Write intermediate wav to a temp file
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
@@ -350,7 +352,7 @@ def save_opus(audio_np: np.ndarray, path: str, sample_rate: int = 44_100):
         torchaudio.save(tmp.name, tensor, sample_rate)
         cmd = [
             "ffmpeg", "-y", "-i", tmp.name,
-            "-c:a", "libopus", "-b:a", OPUS_BITRATE,
+            "-c:a", "libopus", "-b:a", bitrate,
             path,
         ]
         subprocess.run(cmd, check=True, capture_output=True)
@@ -444,11 +446,11 @@ def process_file(
             logger.info(f"[{stem}] Starting vocal separation...")
             vocals, music = separate_vocals(roformer_model, audio_path, device)
             ms_sep = (time.perf_counter() - t0) * 1000
-            logger.info(f"[{stem}] Separation done [{ms_sep:.0f}ms]. Encoding Opus 160 kbps...")
+            logger.info(f"[{stem}] Separation done [{ms_sep:.0f}ms]. Encoding Opus...")
 
             t1 = time.perf_counter()
-            save_opus(vocals, result.vocal_path)
-            save_opus(music, result.music_path)
+            save_opus(vocals, result.vocal_path, bitrate=OPUS_BITRATE_VOCAL)
+            save_opus(music, result.music_path, bitrate=OPUS_BITRATE_MUSIC)
             ms_opus = (time.perf_counter() - t1) * 1000
             logger.info(f"[{stem}] Opus files saved [{ms_opus:.0f}ms].")
 
@@ -602,8 +604,8 @@ def run_pipeline(
                     t1 = time.perf_counter()
                     vocal_path = base + "_voc.opus"
                     music_path = base + "_music.opus"
-                    save_opus(vocals, vocal_path)
-                    save_opus(music, music_path)
+                    save_opus(vocals, vocal_path, bitrate=OPUS_BITRATE_VOCAL)
+                    save_opus(music, music_path, bitrate=OPUS_BITRATE_MUSIC)
                     ms_opus = (time.perf_counter() - t1) * 1000
                     logger.info(f"  [{stem}] Opus saved [{ms_opus:.0f}ms]")
 

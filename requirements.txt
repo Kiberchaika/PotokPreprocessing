@@ -1,0 +1,17 @@
+torch==2.8
+torchaudio==2.8
+torchvision==0.23
+torchmetrics>=1.8
+numpy
+librosa
+# Windowed Roformer (vocal/music separation)
+rotary_embedding_torch==0.3.5
+einops
+# Beat detection
+beat_this @ https://github.com/CPJKU/beat_this/archive/main.zip
+# ASR (NVIDIA Parakeet)
+nemo_toolkit[asr]
+# Blackbird (remote dataset)
+# Blackbird dataset (install from local: pip install -e /path/to/The_Blackbird_Dataset)
+# blackbird-dataset
+webdavclient3
