@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 BATCH_SIZE = 1  # Configurable batch size
 USE_FP16 = True  # Use FP16 for better performance
 # Backend options: "tensorrt", "inductor", "cudagraphs"
-BACKEND = "tensorrt"  # Use TensorRT via torch.compile
+BACKEND = "inductor"  # Use inductor via torch.compile
 
 
 class Audio2BeatsTRT(Audio2Beats):

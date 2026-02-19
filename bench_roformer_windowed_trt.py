@@ -1,28 +1,17 @@
 #!/usr/bin/env python3
 """
 Windowed Roformer benchmark with TensorRT optimization via torch.compile.
-Use: source /home/k4/Projects/PeoplePoseEstimationTestsAug2025/.env/bin/activate
+Use: source /home/k4/Projects/BirdsMilkDatasetPreprocessing/.venv/bin/activate
 """
 
 import os
 import sys
-import ctypes
 
 # Set CUDA to only use GPU 1
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
-# Set up CUDA 13 library path for TensorRT BEFORE importing torch
-_cuda13_lib = "/home/k4/Projects/PeoplePoseEstimationTestsAug2025/.env/lib/python3.10/site-packages/nvidia/cu13/lib"
-if os.path.exists(_cuda13_lib):
-    # Add to LD_LIBRARY_PATH
-    current_ld_path = os.environ.get("LD_LIBRARY_PATH", "")
-    if _cuda13_lib not in current_ld_path:
-        os.environ["LD_LIBRARY_PATH"] = f"{_cuda13_lib}:{current_ld_path}"
-    # Preload the CUDA runtime library
-    try:
-        ctypes.CDLL(os.path.join(_cuda13_lib, "libcudart.so.13"), mode=ctypes.RTLD_GLOBAL)
-    except OSError:
-        pass
+# Add windowed-roformer to path for model/main imports
+sys.path.insert(0, "./windowed-roformer")
 
 import time
 import logging
@@ -156,7 +145,7 @@ def demix_trt(
     pointer = 0
     outputs = []
 
-    with torch.cuda.amp.autocast(enabled=torch.cuda.is_available() and USE_FP16):
+    with torch.amp.autocast('cuda', enabled=torch.cuda.is_available() and USE_FP16):
         with torch.inference_mode():
             while pointer < clips_num:
                 batch_end = min(pointer + batch_size, clips_num)

@@ -24,7 +24,9 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
+import librosa
 import torch
+from tqdm import tqdm
 
 from audio_pipeline import (
     load_beat_model,
@@ -208,6 +210,9 @@ def main() -> None:
     run_sep = mode in ("roformer-asr", "all")
 
     with pipeline:
+        total = len(pipeline._file_list)
+        pbar = tqdm(total=total, desc="Processing", unit="file")
+
         while True:
             # Measure download (take) time
             t0 = time.time()
@@ -224,10 +229,10 @@ def main() -> None:
             stats["download_bytes"] += batch_dl_bytes
             stats["download_time"] += dl_time
 
-            print(f"  -- batch downloaded: {len(items)} files, "
-                  f"{format_size(batch_dl_bytes)}, "
-                  f"{dl_time:.2f}s, "
-                  f"{format_speed(batch_dl_bytes, dl_time)}")
+            tqdm.write(f"  -- batch downloaded: {len(items)} files, "
+                       f"{format_size(batch_dl_bytes)}, "
+                       f"{dl_time:.2f}s, "
+                       f"{format_speed(batch_dl_bytes, dl_time)}")
 
             for item in items:
                 artist = item.metadata.get("artist", "?")
@@ -236,10 +241,12 @@ def main() -> None:
                 mp3_path = item.local_path
                 file_size = mp3_path.stat().st_size if mp3_path.exists() else 0
 
-                print(f"[{processed + 1}] {artist} / {album} / {track}  "
-                      f"({format_size(file_size)})")
+                tqdm.write(f"[{processed + 1}] {artist} / {album} / {track}  "
+                           f"({format_size(file_size)})")
 
                 try:
+                    dur = librosa.get_duration(path=str(mp3_path))
+                    file_start = time.perf_counter()
                     stem = mp3_path.stem
                     parent = mp3_path.parent
 
@@ -297,13 +304,23 @@ def main() -> None:
                         submit_and_log(pipeline, item, lyrics_path,
                                        f"{track}_lyrics.json", stats)
 
+                    elapsed = time.perf_counter() - file_start
+                    dur_hours = dur / 3600
+                    speed = elapsed / dur_hours if dur_hours > 0 else 0
+                    tqdm.write(f"     done in {elapsed:.1f}s "
+                               f"({dur:.0f}s audio, {speed:.0f}s per hour of audio)")
+
                     processed += 1
+                    pbar.update(1)
 
                 except Exception as e:
                     logger.error(f"[{track}] Processing failed: {e}", exc_info=True)
-                    print(f"     ERROR: {e} — skipping")
+                    tqdm.write(f"     ERROR: {e} — skipping")
                     pipeline.skip(item)
                     skipped += 1
+                    pbar.update(1)
+
+        pbar.close()
 
     total_time = time.time() - pipeline_start
 
