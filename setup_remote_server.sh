@@ -12,8 +12,8 @@
 
 set -euo pipefail
 
-DATASET_PATH="/home/k4/Datasets/Music_Part1.01_Test"
-WEBDAV_PORT=8085
+DATASET_PATH="/home/k4/Datasets/Music_Part1.01_Part01"
+WEBDAV_PORT=8091
 WEBDAV_USER="blackbird"
 WEBDAV_PASS="dataset"
 
@@ -38,8 +38,8 @@ echo ""
 echo "=== Step 3: Add result components for streaming uploads ==="
 # These are produced by process_remote_streaming.py and uploaded back.
 # Adding them to the schema makes them visible in stats/find-tracks/reindex.
-blackbird schema add "$DATASET_PATH" "mir.json"  "*.mir.json"
-blackbird schema add "$DATASET_PATH" "vocal.mp3" "*_vocal.mp3"
+#blackbird schema add "$DATASET_PATH" "mir.json"  "*.mir.json"
+#blackbird schema add "$DATASET_PATH" "vocal.mp3" "*_vocal.mp3"
 
 echo ""
 echo "=== Step 4: Build index ==="
