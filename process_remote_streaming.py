@@ -48,11 +48,11 @@ from blackbird.streaming import StreamingPipeline
 # Defaults
 # ---------------------------------------------------------------------------
 
-DEFAULT_SERVER_URL = "https://188.120.253.126:8085/"
+DEFAULT_SERVER_URL = "https://188.120.253.126:8091/"
 DEFAULT_USERNAME = "blackbird"
 DEFAULT_PASSWORD = "dataset"
 DEFAULT_SSH_KEY = "dev-233158-kiberchaika.pem"
-DEFAULT_DATASET_PATH = "/home/k4/Datasets/Music_Part1.01_Test"
+DEFAULT_DATASET_PATH = "/home/k4/Datasets/Music_Part1.01_Part01"
 DEFAULT_MODE = "all"
 DEFAULT_BATCH_SIZE = 4
 DEFAULT_PREFETCH_WORKERS = 4
