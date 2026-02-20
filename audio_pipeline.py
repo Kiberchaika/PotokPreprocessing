@@ -106,9 +106,10 @@ def _compile(model, backend: str, label: str = "model"):
         else:
             return torch.compile(
                 model,
-                mode="max-autotune-no-cudagraphs",
+                mode="default",
                 backend="inductor",
                 fullgraph=False,
+                dynamic=True,
             )
     except Exception as exc:
         logger.warning(f"{label} compile ({backend}) failed: {exc}")
@@ -116,9 +117,10 @@ def _compile(model, backend: str, label: str = "model"):
             try:
                 compiled = torch.compile(
                     model,
-                    mode="max-autotune-no-cudagraphs",
+                    mode="default",
                     backend="inductor",
                     fullgraph=False,
+                    dynamic=True,
                 )
                 logger.info(f"{label}: inductor fallback OK.")
                 return compiled
