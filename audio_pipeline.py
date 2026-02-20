@@ -44,10 +44,10 @@ import torchaudio
 # Suppress noisy warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 logging.getLogger("torch_tensorrt").setLevel(logging.ERROR)
-logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
-logging.getLogger("torch._inductor").setLevel(logging.ERROR)
-logging.getLogger("torch.fx").setLevel(logging.ERROR)
-logging.getLogger("torch._functorch").setLevel(logging.ERROR)
+#logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
+#logging.getLogger("torch._inductor").setLevel(logging.ERROR)
+#logging.getLogger("torch.fx").setLevel(logging.ERROR)
+#logging.getLogger("torch._functorch").setLevel(logging.ERROR)
 
 torch.set_float32_matmul_precision("high")
 
@@ -160,7 +160,7 @@ def load_roformer_model(device: str):
     ckpt = torch.load(ROFORMER_CKPT_NAME, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt, strict=True)
     model = model.to(device).eval()
-    model = _compile(model, ROFORMER_BACKEND, label="Roformer", dynamic=True)
+    model = _compile(model, ROFORMER_BACKEND, label="Roformer")
     return model
 
 
@@ -172,8 +172,6 @@ def load_asr_model(device: str):
     asr.eval()
     if device == "cuda":
         asr = asr.cuda()
-        if hasattr(asr, "encoder"):
-            asr.encoder = _compile(asr.encoder, ASR_BACKEND, label="ASR-encoder")
     return asr
 
 
@@ -316,8 +314,16 @@ def separate_vocals(
         with torch.inference_mode():
             ptr = 0
             while ptr < n_chunks:
-                batch = chunks[ptr : ptr + BATCH_SIZE].to(device)
-                out = roformer_model(batch).cpu()
+                batch = chunks[ptr : ptr + BATCH_SIZE]
+                actual = batch.shape[0]
+                # Pad last batch to BATCH_SIZE to keep tensor shape constant
+                # and avoid torch.compile recompilation
+                if actual < BATCH_SIZE:
+                    pad = chunks[:BATCH_SIZE - actual]
+                    batch = torch.cat([batch, pad], dim=0)
+                out = roformer_model(batch.to(device)).cpu()
+                if actual < BATCH_SIZE:
+                    out = out[:actual]
                 outputs.append(out)
                 ptr += BATCH_SIZE
 

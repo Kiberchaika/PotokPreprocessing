@@ -209,7 +209,41 @@ def main() -> None:
     run_beats = mode in ("beats", "all")
     run_sep = mode in ("roformer-asr", "all")
 
+    # Build set of required components based on mode
+    needed_components = set()
+    if run_beats:
+        needed_components.add("beats")
+    if run_sep:
+        needed_components.update(("vocal", "music", "lyrics"))
+
     with pipeline:
+        # Pre-filter file list: remove tracks that already have all needed components
+        idx = pipeline._index
+        if idx and needed_components:
+            # Build lookup: (artist, album, track) -> set of existing components
+            track_components = {}
+            for _, track_info in idx.tracks.items():
+                key = (track_info.artist,
+                       track_info.album_path.split("/")[-1],
+                       track_info.base_name)
+                track_components[key] = set(track_info.files.keys())
+
+            original_count = len(pipeline._file_list)
+            filtered = []
+            for entry in pipeline._file_list:
+                meta = entry["metadata"]
+                key = (meta["artist"], meta["album"], meta["track"])
+                existing = track_components.get(key, set())
+                if needed_components.issubset(existing):
+                    skipped += 1
+                else:
+                    filtered.append(entry)
+            pipeline._file_list = filtered
+            if skipped > 0:
+                print(f"Skipped {skipped}/{original_count} tracks "
+                      f"(already have {', '.join(sorted(needed_components))})")
+                print(f"Remaining: {len(filtered)} tracks to process\n")
+
         total = len(pipeline._file_list)
         pbar = tqdm(total=total, desc="Processing", unit="file")
 
