@@ -44,6 +44,10 @@ import torchaudio
 # Suppress noisy warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 logging.getLogger("torch_tensorrt").setLevel(logging.ERROR)
+logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
+logging.getLogger("torch._inductor").setLevel(logging.ERROR)
+logging.getLogger("torch.fx").setLevel(logging.ERROR)
+logging.getLogger("torch._functorch").setLevel(logging.ERROR)
 
 torch.set_float32_matmul_precision("high")
 
@@ -88,9 +92,9 @@ class FileResult:
 #  Model loaders (called once, reused across files)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _compile(model, backend: str, label: str = "model"):
+def _compile(model, backend: str, label: str = "model", dynamic: bool = False):
     """Compile a model with torch.compile; fall back to inductor then raw."""
-    logger.info(f"Compiling {label} with backend={backend}...")
+    logger.info(f"Compiling {label} with backend={backend}, dynamic={dynamic}...")
     try:
         if backend == "tensorrt":
             import torch_tensorrt  # noqa: F401 – registers backend
@@ -109,7 +113,7 @@ def _compile(model, backend: str, label: str = "model"):
                 mode="default",
                 backend="inductor",
                 fullgraph=False,
-                dynamic=True,
+                dynamic=dynamic,
             )
     except Exception as exc:
         logger.warning(f"{label} compile ({backend}) failed: {exc}")
@@ -120,7 +124,7 @@ def _compile(model, backend: str, label: str = "model"):
                     mode="default",
                     backend="inductor",
                     fullgraph=False,
-                    dynamic=True,
+                    dynamic=dynamic,
                 )
                 logger.info(f"{label}: inductor fallback OK.")
                 return compiled
@@ -156,7 +160,7 @@ def load_roformer_model(device: str):
     ckpt = torch.load(ROFORMER_CKPT_NAME, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt, strict=True)
     model = model.to(device).eval()
-    model = _compile(model, ROFORMER_BACKEND, label="Roformer")
+    model = _compile(model, ROFORMER_BACKEND, label="Roformer", dynamic=True)
     return model
 
 
