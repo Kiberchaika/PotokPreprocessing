@@ -20,22 +20,8 @@ import sys
 import ctypes
 
 # ── CUDA / env setup (before any torch import) ────────────────────────────
-os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "1")
+os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
 
-_cuda13_lib = (
-    "/home/k4/Projects/PeoplePoseEstimationTestsAug2025/"
-    ".env/lib/python3.10/site-packages/nvidia/cu13/lib"
-)
-if os.path.exists(_cuda13_lib):
-    cur = os.environ.get("LD_LIBRARY_PATH", "")
-    if _cuda13_lib not in cur:
-        os.environ["LD_LIBRARY_PATH"] = f"{_cuda13_lib}:{cur}"
-    try:
-        ctypes.CDLL(
-            os.path.join(_cuda13_lib, "libcudart.so.13"), mode=ctypes.RTLD_GLOBAL
-        )
-    except OSError:
-        pass
 
 import argparse
 import fcntl
