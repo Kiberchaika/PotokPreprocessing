@@ -20,7 +20,9 @@ import argparse
 import json
 import subprocess
 import sys
+import threading
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
@@ -34,11 +36,11 @@ from audio_pipeline import (
     load_asr_model,
     detect_beats,
     separate_vocals,
-    save_opus,
     transcribe_audio,
     logger,
     OPUS_BITRATE_VOCAL,
     OPUS_BITRATE_MUSIC,
+    OpusEncodePool,
 )
 
 from blackbird.streaming import StreamingPipeline
@@ -127,7 +129,7 @@ def format_speed(size_bytes: int, elapsed_sec: float) -> str:
 
 
 def submit_and_log(pipeline, item, result_path: Path, remote_name: str,
-                   stats: dict) -> None:
+                   stats: dict, stats_lock: threading.Lock) -> None:
     """Submit a result file for upload and accumulate stats."""
     file_size = result_path.stat().st_size
     t0 = time.time()
@@ -137,8 +139,9 @@ def submit_and_log(pipeline, item, result_path: Path, remote_name: str,
         remote_name=remote_name,
     )
     ul_time = time.time() - t0
-    stats["upload_bytes"] += file_size
-    stats["upload_time"] += ul_time
+    with stats_lock:
+        stats["upload_bytes"] += file_size
+        stats["upload_time"] += ul_time
     print(f"     -> queued {remote_name} ({format_size(file_size)})")
 
 
@@ -204,6 +207,7 @@ def main() -> None:
         "upload_bytes": 0,
         "upload_time": 0.0,
     }
+    stats_lock = threading.Lock()
     pipeline_start = time.time()
 
     run_beats = mode in ("beats", "all")
@@ -247,112 +251,125 @@ def main() -> None:
         total = len(pipeline._file_list)
         pbar = tqdm(total=total, desc="Processing", unit="file")
 
-        while True:
-            # Measure download (take) time
-            t0 = time.time()
-            items = pipeline.take(count=batch_size)
-            dl_time = time.time() - t0
+        with ExitStack() as stack:
+            opus_pool = stack.enter_context(OpusEncodePool()) if run_sep else None
+            while True:
+                # Measure download (take) time
+                t0 = time.time()
+                items = pipeline.take(count=batch_size)
+                dl_time = time.time() - t0
 
-            if not items:
-                break
+                if not items:
+                    break
 
-            batch_dl_bytes = sum(
-                item.local_path.stat().st_size for item in items
-                if item.local_path.exists()
-            )
-            stats["download_bytes"] += batch_dl_bytes
-            stats["download_time"] += dl_time
+                batch_dl_bytes = sum(
+                    item.local_path.stat().st_size for item in items
+                    if item.local_path.exists()
+                )
+                stats["download_bytes"] += batch_dl_bytes
+                stats["download_time"] += dl_time
 
-            tqdm.write(f"  -- batch downloaded: {len(items)} files, "
-                       f"{format_size(batch_dl_bytes)}, "
-                       f"{dl_time:.2f}s, "
-                       f"{format_speed(batch_dl_bytes, dl_time)}")
+                tqdm.write(f"  -- batch downloaded: {len(items)} files, "
+                           f"{format_size(batch_dl_bytes)}, "
+                           f"{dl_time:.2f}s, "
+                           f"{format_speed(batch_dl_bytes, dl_time)}")
 
-            for item in items:
-                artist = item.metadata.get("artist", "?")
-                album = item.metadata.get("album", "?")
-                track = item.metadata.get("track", "?")
-                mp3_path = item.local_path
-                file_size = mp3_path.stat().st_size if mp3_path.exists() else 0
+                for item in items:
+                    artist = item.metadata.get("artist", "?")
+                    album = item.metadata.get("album", "?")
+                    track = item.metadata.get("track", "?")
+                    mp3_path = item.local_path
+                    file_size = mp3_path.stat().st_size if mp3_path.exists() else 0
 
-                tqdm.write(f"[{processed + 1}] {artist} / {album} / {track}  "
-                           f"({format_size(file_size)})")
+                    tqdm.write(f"[{processed + 1}] {artist} / {album} / {track}  "
+                               f"({format_size(file_size)})")
 
-                try:
-                    dur = librosa.get_duration(path=str(mp3_path))
-                    file_start = time.perf_counter()
-                    stem = mp3_path.stem
-                    parent = mp3_path.parent
+                    try:
+                        dur = librosa.get_duration(path=str(mp3_path))
+                        file_start = time.perf_counter()
+                        stem = mp3_path.stem
+                        parent = mp3_path.parent
+                        beats_path = None
 
-                    # 1) Beat detection -> _beats.json
-                    if run_beats:
-                        t1 = time.perf_counter()
-                        beats, downbeats = detect_beats(beat_model, str(mp3_path))
-                        ms = (time.perf_counter() - t1) * 1000
-                        logger.info(f"[{track}] Beat detection: {len(beats)} beats, "
-                                    f"{len(downbeats)} downbeats [{ms:.0f}ms]")
+                        # 1) Beat detection — write JSON now, upload after GPU
+                        #    is done with the mp3 (upload workers delete the source).
+                        if run_beats:
+                            t1 = time.perf_counter()
+                            beats, downbeats = detect_beats(beat_model, str(mp3_path))
+                            ms = (time.perf_counter() - t1) * 1000
+                            logger.info(f"[{track}] Beat detection: {len(beats)} beats, "
+                                        f"{len(downbeats)} downbeats [{ms:.0f}ms]")
 
-                        beats_data = {"beats": beats, "downbeats": downbeats}
-                        beats_path = parent / f"{stem}_beats.json"
-                        beats_path.write_text(json.dumps(beats_data, indent=2))
-                        submit_and_log(pipeline, item, beats_path,
-                                       f"{stem}_beats.json", stats)
+                            beats_data = {"beats": beats, "downbeats": downbeats}
+                            beats_path = parent / f"{stem}_beats.json"
+                            beats_path.write_text(json.dumps(beats_data, indent=2))
 
-                    # 2) Vocal separation -> _voc.opus + _music.opus
-                    #    ASR on vocals  -> _lyrics.json
-                    if run_sep:
-                        t1 = time.perf_counter()
-                        vocals_np, music_np = separate_vocals(
-                            roformer_model, str(mp3_path), device)
-                        ms_sep = (time.perf_counter() - t1) * 1000
-                        logger.info(f"[{track}] Separation [{ms_sep:.0f}ms]")
+                        # 2) Vocal separation -> queue Opus, ASR on vocals
+                        if run_sep:
+                            t1 = time.perf_counter()
+                            vocals_np, music_np = separate_vocals(
+                                roformer_model, str(mp3_path), device)
+                            ms_sep = (time.perf_counter() - t1) * 1000
+                            logger.info(f"[{track}] Separation [{ms_sep:.0f}ms]")
 
-                        # Encode to Opus
-                        t2 = time.perf_counter()
-                        vocal_path = parent / f"{stem}_voc.opus"
-                        music_path = parent / f"{stem}_music.opus"
-                        save_opus(vocals_np, str(vocal_path), bitrate=OPUS_BITRATE_VOCAL)
-                        save_opus(music_np, str(music_path), bitrate=OPUS_BITRATE_MUSIC)
-                        ms_opus = (time.perf_counter() - t2) * 1000
-                        logger.info(f"[{track}] Opus saved [{ms_opus:.0f}ms]")
+                            vocal_path = parent / f"{stem}_voc.opus"
+                            music_path = parent / f"{stem}_music.opus"
 
-                        submit_and_log(pipeline, item, vocal_path,
-                                       f"{stem}_voc.opus", stats)
-                        submit_and_log(pipeline, item, music_path,
-                                       f"{stem}_music.opus", stats)
+                            def _opus_done(path, ms, error, _item=item, _track=track):
+                                remote_name = Path(path).name
+                                if error is not None:
+                                    logger.error(
+                                        f"[{_track}] Opus {remote_name} failed: {error}")
+                                    return
+                                logger.info(
+                                    f"[{_track}] Opus saved {remote_name} [{ms:.0f}ms]")
+                                submit_and_log(
+                                    pipeline, _item, Path(path), remote_name,
+                                    stats, stats_lock)
 
-                        # ASR transcription
-                        t3 = time.perf_counter()
-                        asr_out = transcribe_audio(asr_model, vocals_np)
-                        ms_asr = (time.perf_counter() - t3) * 1000
-                        logger.info(f"[{track}] ASR: {len(asr_out['text'])} chars [{ms_asr:.0f}ms]")
+                            opus_pool.submit(
+                                vocals_np, str(vocal_path),
+                                bitrate=OPUS_BITRATE_VOCAL, on_done=_opus_done)
+                            opus_pool.submit(
+                                music_np, str(music_path),
+                                bitrate=OPUS_BITRATE_MUSIC, on_done=_opus_done)
+                            logger.info(f"[{track}] Opus encode queued (background)")
 
-                        lyrics_data = {
-                            "text": asr_out["text"],
-                            "segments": asr_out["segments"],
-                            "words": asr_out["words"],
-                        }
-                        lyrics_path = parent / f"{stem}_lyrics.json"
-                        lyrics_path.write_text(
-                            json.dumps(lyrics_data, ensure_ascii=False, indent=2))
-                        submit_and_log(pipeline, item, lyrics_path,
-                                       f"{stem}_lyrics.json", stats)
+                            t3 = time.perf_counter()
+                            asr_out = transcribe_audio(asr_model, vocals_np)
+                            ms_asr = (time.perf_counter() - t3) * 1000
+                            logger.info(f"[{track}] ASR: {len(asr_out['text'])} chars [{ms_asr:.0f}ms]")
 
-                    elapsed = time.perf_counter() - file_start
-                    dur_hours = dur / 3600
-                    speed = elapsed / dur_hours if dur_hours > 0 else 0
-                    tqdm.write(f"     done in {elapsed:.1f}s "
-                               f"({dur:.0f}s audio, {speed:.0f}s per hour of audio)")
+                            lyrics_data = {
+                                "text": asr_out["text"],
+                                "segments": asr_out["segments"],
+                                "words": asr_out["words"],
+                            }
+                            lyrics_path = parent / f"{stem}_lyrics.json"
+                            lyrics_path.write_text(
+                                json.dumps(lyrics_data, ensure_ascii=False, indent=2))
+                            submit_and_log(pipeline, item, lyrics_path,
+                                           f"{stem}_lyrics.json", stats, stats_lock)
 
-                    processed += 1
-                    pbar.update(1)
+                        if beats_path is not None:
+                            submit_and_log(pipeline, item, beats_path,
+                                           f"{stem}_beats.json", stats, stats_lock)
 
-                except Exception as e:
-                    logger.error(f"[{track}] Processing failed: {e}", exc_info=True)
-                    tqdm.write(f"     ERROR: {e} — skipping")
-                    pipeline.skip(item)
-                    skipped += 1
-                    pbar.update(1)
+                        elapsed = time.perf_counter() - file_start
+                        dur_hours = dur / 3600
+                        speed = elapsed / dur_hours if dur_hours > 0 else 0
+                        tqdm.write(f"     done in {elapsed:.1f}s "
+                                   f"({dur:.0f}s audio, {speed:.0f}s per hour of audio)")
+
+                        processed += 1
+                        pbar.update(1)
+
+                    except Exception as e:
+                        logger.error(f"[{track}] Processing failed: {e}", exc_info=True)
+                        tqdm.write(f"     ERROR: {e} — skipping")
+                        pipeline.skip(item)
+                        skipped += 1
+                        pbar.update(1)
 
         pbar.close()
 

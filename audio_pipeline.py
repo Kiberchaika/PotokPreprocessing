@@ -30,12 +30,14 @@ import json
 import logging
 import subprocess
 import tempfile
+import threading
 import time
 import traceback
 import warnings
+from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -67,6 +69,7 @@ ASR_MODEL_NAME = "nvidia/parakeet-tdt-0.6b-v3"
 ASR_TARGET_SR = 16_000
 OPUS_BITRATE_VOCAL = "96k"
 OPUS_BITRATE_MUSIC = "128k"
+OPUS_WORKERS = int(os.environ.get("OPUS_WORKERS", "8"))
 
 ROFORMER_CKPT_NAME = "mbr-win10-sink8.ckpt"
 ROFORMER_CKPT_URL = (
@@ -340,22 +343,111 @@ def separate_vocals(
 
 def save_opus(audio_np: np.ndarray, path: str, sample_rate: int = 44_100,
               bitrate: str = OPUS_BITRATE_VOCAL):
-    """Save numpy audio array as Opus via ffmpeg."""
-    # Write intermediate wav to a temp file
-    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    try:
-        tensor = torch.from_numpy(audio_np).float()
-        if tensor.dim() == 1:
-            tensor = tensor.unsqueeze(0)
-        torchaudio.save(tmp.name, tensor, sample_rate)
-        cmd = [
-            "ffmpeg", "-y", "-i", tmp.name,
-            "-c:a", "libopus", "-b:a", bitrate,
-            path,
-        ]
-        subprocess.run(cmd, check=True, capture_output=True)
-    finally:
-        os.unlink(tmp.name)
+    """Encode numpy audio (channels, samples) to Opus via ffmpeg stdin.
+
+    Pipes interleaved float32 PCM so we skip the intermediate WAV round-trip.
+    """
+    arr = np.asarray(audio_np, dtype=np.float32)
+    if arr.ndim == 1:
+        arr = arr[np.newaxis, :]
+    channels = int(arr.shape[0])
+    interleaved = np.ascontiguousarray(arr.T)
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "f32le", "-ar", str(sample_rate), "-ac", str(channels),
+        "-i", "pipe:0",
+        "-c:a", "libopus", "-b:a", bitrate, "-application", "audio",
+        path,
+    ]
+    subprocess.run(cmd, input=interleaved.tobytes(), check=True, capture_output=True)
+
+
+OpusDoneCallback = Callable[[str, float, Optional[BaseException]], None]
+
+
+class OpusEncodePool:
+    """Background ffmpeg Opus encoder so GPU inference is not blocked.
+
+    ``submit`` blocks only when ``max_outstanding`` jobs already hold audio
+    in RAM (backpressure). Vocal and music stems are independent jobs and
+    encode in parallel.
+    """
+
+    def __init__(
+        self,
+        max_workers: int = OPUS_WORKERS,
+        max_outstanding: Optional[int] = None,
+    ):
+        workers = max(1, max_workers)
+        outstanding = max_outstanding if max_outstanding is not None else workers * 2
+        self.max_workers = workers
+        self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="opus")
+        self._slots = threading.BoundedSemaphore(outstanding)
+        self._lock = threading.Lock()
+        self._futures: List[Future] = []
+        self._errors: List[BaseException] = []
+        logger.info(
+            f"Opus encoder pool: {workers} workers, max {outstanding} in-flight stems"
+        )
+
+    def submit(
+        self,
+        audio_np: np.ndarray,
+        path: str,
+        bitrate: str = OPUS_BITRATE_VOCAL,
+        sample_rate: int = 44_100,
+        on_done: Optional[OpusDoneCallback] = None,
+    ) -> Future:
+        self._slots.acquire()
+        future = self._pool.submit(
+            self._run_job, audio_np, path, bitrate, sample_rate, on_done
+        )
+        with self._lock:
+            self._futures.append(future)
+        return future
+
+    def _run_job(
+        self,
+        audio_np: np.ndarray,
+        path: str,
+        bitrate: str,
+        sample_rate: int,
+        on_done: Optional[OpusDoneCallback],
+    ) -> None:
+        t0 = time.perf_counter()
+        error: Optional[BaseException] = None
+        try:
+            save_opus(audio_np, path, sample_rate=sample_rate, bitrate=bitrate)
+        except Exception as exc:
+            error = exc
+            with self._lock:
+                self._errors.append(exc)
+            logger.error(f"Opus encode failed for {path}: {exc}")
+        finally:
+            self._slots.release()
+        ms = (time.perf_counter() - t0) * 1000
+        if on_done is not None:
+            try:
+                on_done(path, ms, error)
+            except Exception as cb_exc:
+                logger.error(f"Opus on_done callback failed for {path}: {cb_exc}")
+
+    def wait(self) -> None:
+        with self._lock:
+            futures = list(self._futures)
+        for future in futures:
+            future.result()
+
+    def shutdown(self, wait: bool = True) -> None:
+        if wait:
+            self.wait()
+        self._pool.shutdown(wait=wait)
+
+    def __enter__(self) -> "OpusEncodePool":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.shutdown(wait=True)
 
 
 def transcribe_audio(asr_model, audio_np: np.ndarray, sample_rate: int = 44_100) -> Dict:
@@ -410,6 +502,7 @@ def process_file(
     roformer_model=None,
     asr_model=None,
     device: str = "cuda",
+    opus_pool: Optional[OpusEncodePool] = None,
 ) -> FileResult:
     """Process a single audio file. mode: 'beats', 'roformer-asr', or 'all'."""
     rel = os.path.relpath(audio_path, input_dir)
@@ -446,11 +539,16 @@ def process_file(
             ms_sep = (time.perf_counter() - t0) * 1000
             logger.info(f"[{stem}] Separation done [{ms_sep:.0f}ms]. Encoding Opus...")
 
-            t1 = time.perf_counter()
-            save_opus(vocals, result.vocal_path, bitrate=OPUS_BITRATE_VOCAL)
-            save_opus(music, result.music_path, bitrate=OPUS_BITRATE_MUSIC)
-            ms_opus = (time.perf_counter() - t1) * 1000
-            logger.info(f"[{stem}] Opus files saved [{ms_opus:.0f}ms].")
+            if opus_pool is not None:
+                opus_pool.submit(vocals, result.vocal_path, bitrate=OPUS_BITRATE_VOCAL)
+                opus_pool.submit(music, result.music_path, bitrate=OPUS_BITRATE_MUSIC)
+                logger.info(f"[{stem}] Opus encode queued (background).")
+            else:
+                t1 = time.perf_counter()
+                save_opus(vocals, result.vocal_path, bitrate=OPUS_BITRATE_VOCAL)
+                save_opus(music, result.music_path, bitrate=OPUS_BITRATE_MUSIC)
+                ms_opus = (time.perf_counter() - t1) * 1000
+                logger.info(f"[{stem}] Opus files saved [{ms_opus:.0f}ms].")
 
             t2 = time.perf_counter()
             logger.info(f"[{stem}] Starting ASR on vocals...")
@@ -542,153 +640,142 @@ def run_pipeline(
     # ── Process all files ─────────────────────────────────────────────
     results: List[FileResult] = []
     total_start = time.perf_counter()
+    opus_pool = OpusEncodePool() if mode in ("roformer-asr", "all") else None
 
-    if mode == "beats":
-        for batch_start in range(0, len(mp3_files), BATCH_SIZE):
-            batch_paths = mp3_files[batch_start : batch_start + BATCH_SIZE]
-            batch_end = batch_start + len(batch_paths)
-            logger.info(f"\n{'═'*60}")
-            logger.info(f"Batch [{batch_start+1}–{batch_end}/{len(mp3_files)}] ({len(batch_paths)} files)")
-            logger.info(f"{'═'*60}")
+    try:
+        if mode == "beats":
+            for batch_start in range(0, len(mp3_files), BATCH_SIZE):
+                batch_paths = mp3_files[batch_start : batch_start + BATCH_SIZE]
+                batch_end = batch_start + len(batch_paths)
+                logger.info(f"\n{'═'*60}")
+                logger.info(f"Batch [{batch_start+1}–{batch_end}/{len(mp3_files)}] ({len(batch_paths)} files)")
+                logger.info(f"{'═'*60}")
 
-            file_start = time.perf_counter()
-            try:
-                batch_results = detect_beats_batch(beat_model, batch_paths)
-                ms = (time.perf_counter() - file_start) * 1000
-                for path, (beats, downbeats) in zip(batch_paths, batch_results):
-                    rel = os.path.relpath(path, input_dir)
-                    base = os.path.join(output_dir, os.path.splitext(rel)[0])
-                    os.makedirs(os.path.dirname(base), exist_ok=True)
-
-                    r = FileResult(input_file=path, beats=beats, downbeats=downbeats)
-                    results.append(r)
-
-                    beats_path = base + "_beats.json"
-                    save_json_locked(beats_path, {
-                        "beats": beats,
-                        "downbeats": downbeats,
-                    })
-
-                    logger.info(f"  [{rel}] {len(beats)} beats, {len(downbeats)} downbeats")
-                logger.info(f"Batch done [{ms:.0f}ms]")
-            except Exception as exc:
-                logger.error(f"Batch failed: {exc}")
-                traceback.print_exc()
-                for path in batch_paths:
-                    results.append(FileResult(input_file=path, error=str(exc)))
-
-    elif mode == "roformer-asr":
-        for batch_start in range(0, len(mp3_files), BATCH_SIZE):
-            batch_paths = mp3_files[batch_start : batch_start + BATCH_SIZE]
-            batch_end = batch_start + len(batch_paths)
-            logger.info(f"\n{'═'*60}")
-            logger.info(f"Batch [{batch_start+1}–{batch_end}/{len(mp3_files)}] ({len(batch_paths)} files)")
-            logger.info(f"{'═'*60}")
-
-            batch_t0 = time.perf_counter()
-
-            sep_results = []
-            for path in batch_paths:
-                rel = os.path.relpath(path, input_dir)
-                stem = os.path.splitext(rel)[0]
-                base = os.path.join(output_dir, stem)
-                os.makedirs(os.path.dirname(base), exist_ok=True)
+                file_start = time.perf_counter()
                 try:
-                    t0 = time.perf_counter()
-                    vocals, music = separate_vocals(roformer_model, path, device)
-                    ms_sep = (time.perf_counter() - t0) * 1000
-                    logger.info(f"  [{stem}] Separation [{ms_sep:.0f}ms]")
+                    batch_results = detect_beats_batch(beat_model, batch_paths)
+                    ms = (time.perf_counter() - file_start) * 1000
+                    for path, (beats, downbeats) in zip(batch_paths, batch_results):
+                        rel = os.path.relpath(path, input_dir)
+                        base = os.path.join(output_dir, os.path.splitext(rel)[0])
+                        os.makedirs(os.path.dirname(base), exist_ok=True)
 
-                    t1 = time.perf_counter()
+                        r = FileResult(input_file=path, beats=beats, downbeats=downbeats)
+                        results.append(r)
+
+                        beats_path = base + "_beats.json"
+                        save_json_locked(beats_path, {
+                            "beats": beats,
+                            "downbeats": downbeats,
+                        })
+
+                        logger.info(f"  [{rel}] {len(beats)} beats, {len(downbeats)} downbeats")
+                    logger.info(f"Batch done [{ms:.0f}ms]")
+                except Exception as exc:
+                    logger.error(f"Batch failed: {exc}")
+                    traceback.print_exc()
+                    for path in batch_paths:
+                        results.append(FileResult(input_file=path, error=str(exc)))
+
+        elif mode == "roformer-asr":
+            for batch_start in range(0, len(mp3_files), BATCH_SIZE):
+                batch_paths = mp3_files[batch_start : batch_start + BATCH_SIZE]
+                batch_end = batch_start + len(batch_paths)
+                logger.info(f"\n{'═'*60}")
+                logger.info(f"Batch [{batch_start+1}–{batch_end}/{len(mp3_files)}] ({len(batch_paths)} files)")
+                logger.info(f"{'═'*60}")
+
+                batch_t0 = time.perf_counter()
+
+                for path in batch_paths:
+                    rel = os.path.relpath(path, input_dir)
+                    stem = os.path.splitext(rel)[0]
+                    base = os.path.join(output_dir, stem)
+                    os.makedirs(os.path.dirname(base), exist_ok=True)
                     vocal_path = base + "_voc.opus"
                     music_path = base + "_music.opus"
-                    save_opus(vocals, vocal_path, bitrate=OPUS_BITRATE_VOCAL)
-                    save_opus(music, music_path, bitrate=OPUS_BITRATE_MUSIC)
-                    ms_opus = (time.perf_counter() - t1) * 1000
-                    logger.info(f"  [{stem}] Opus saved [{ms_opus:.0f}ms]")
+                    try:
+                        t0 = time.perf_counter()
+                        vocals, music = separate_vocals(roformer_model, path, device)
+                        ms_sep = (time.perf_counter() - t0) * 1000
+                        logger.info(f"  [{stem}] Separation [{ms_sep:.0f}ms]")
 
-                    sep_results.append((path, rel, base, vocals, vocal_path, music_path))
-                except Exception as exc:
-                    logger.error(f"  [{stem}] Separation failed: {exc}")
-                    traceback.print_exc()
-                    results.append(FileResult(input_file=path, error=f"separation: {exc}"))
-                    sep_results.append(None)
+                        opus_pool.submit(vocals, vocal_path, bitrate=OPUS_BITRATE_VOCAL)
+                        opus_pool.submit(music, music_path, bitrate=OPUS_BITRATE_MUSIC)
+                        logger.info(f"  [{stem}] Opus encode queued (background)")
 
-            ms_phase1 = (time.perf_counter() - batch_t0) * 1000
-            logger.info(f"  Phase 1 (separation+opus) done [{ms_phase1:.0f}ms]")
+                        t0 = time.perf_counter()
+                        asr_out = transcribe_audio(asr_model, vocals)
+                        ms_asr = (time.perf_counter() - t0) * 1000
+                        logger.info(f"  [{stem}] ASR: {len(asr_out['text'])} chars [{ms_asr:.0f}ms]")
 
-            t_asr0 = time.perf_counter()
-            for item in sep_results:
-                if item is None:
-                    continue
-                path, rel, base, vocals, vocal_path, music_path = item
-                stem = os.path.splitext(rel)[0]
+                        r = FileResult(input_file=path, vocal_path=vocal_path, music_path=music_path,
+                                       text=asr_out["text"], segments=asr_out["segments"],
+                                       words=asr_out["words"])
+                        results.append(r)
+
+                        lyrics_path = base + "_lyrics.json"
+                        save_json_locked(lyrics_path, {
+                            "text": asr_out["text"],
+                            "segments": asr_out["segments"],
+                            "words": asr_out["words"],
+                        })
+                    except Exception as exc:
+                        logger.error(f"  [{stem}] Separation/ASR failed: {exc}")
+                        traceback.print_exc()
+                        results.append(FileResult(input_file=path, error=str(exc)))
+
+                ms_batch = (time.perf_counter() - batch_t0) * 1000
+                logger.info(f"Batch done [{ms_batch:.0f}ms]")
+
+        else:
+            for idx, mp3 in enumerate(mp3_files, 1):
+                logger.info(f"\n{'═'*60}")
+                logger.info(f"Processing [{idx}/{len(mp3_files)}]: {os.path.relpath(mp3, input_dir)}")
+                logger.info(f"{'═'*60}")
+
+                file_start = time.perf_counter()
                 try:
-                    t0 = time.perf_counter()
-                    asr_out = transcribe_audio(asr_model, vocals)
-                    ms_asr = (time.perf_counter() - t0) * 1000
-                    logger.info(f"  [{stem}] ASR: {len(asr_out['text'])} chars [{ms_asr:.0f}ms]")
-
-                    r = FileResult(input_file=path, vocal_path=vocal_path, music_path=music_path,
-                                   text=asr_out["text"], segments=asr_out["segments"],
-                                   words=asr_out["words"])
+                    r = process_file(
+                        mp3, output_dir, input_dir, mode,
+                        beat_model, roformer_model, asr_model, device,
+                        opus_pool=opus_pool,
+                    )
                     results.append(r)
-
-                    lyrics_path = base + "_lyrics.json"
-                    save_json_locked(lyrics_path, {
-                        "text": asr_out["text"],
-                        "segments": asr_out["segments"],
-                        "words": asr_out["words"],
-                    })
                 except Exception as exc:
-                    logger.error(f"  [{stem}] ASR failed: {exc}")
+                    logger.error(f"Failed on {mp3}: {exc}")
                     traceback.print_exc()
-                    results.append(FileResult(input_file=path, error=f"asr: {exc}"))
+                    results.append(FileResult(input_file=mp3, error=str(exc)))
 
-            ms_phase2 = (time.perf_counter() - t_asr0) * 1000
-            ms_batch = (time.perf_counter() - batch_t0) * 1000
-            logger.info(f"  Phase 2 (ASR) done [{ms_phase2:.0f}ms]")
-            logger.info(f"Batch done [{ms_batch:.0f}ms]")
+                elapsed = time.perf_counter() - file_start
+                logger.info(f"[{os.path.relpath(mp3, input_dir)}] finished in {elapsed:.1f}s")
 
-    else:
-        for idx, mp3 in enumerate(mp3_files, 1):
-            logger.info(f"\n{'═'*60}")
-            logger.info(f"Processing [{idx}/{len(mp3_files)}]: {os.path.relpath(mp3, input_dir)}")
-            logger.info(f"{'═'*60}")
+        if opus_pool is not None:
+            logger.info("Waiting for background Opus encodes to finish...")
+            opus_pool.wait()
 
-            file_start = time.perf_counter()
-            try:
-                r = process_file(mp3, output_dir, input_dir, mode,
-                                 beat_model, roformer_model, asr_model, device)
-                results.append(r)
-            except Exception as exc:
-                logger.error(f"Failed on {mp3}: {exc}")
-                traceback.print_exc()
-                results.append(FileResult(input_file=mp3, error=str(exc)))
+        total_time = time.perf_counter() - total_start
 
-            elapsed = time.perf_counter() - file_start
-            logger.info(f"[{os.path.relpath(mp3, input_dir)}] finished in {elapsed:.1f}s")
+        ok = sum(1 for r in results if r.error is None)
+        avg_per_hour = total_time / total_audio_hours if total_audio_hours > 0 else 0.0
 
-    total_time = time.perf_counter() - total_start
+        logger.info(f"\n{'═'*60}")
+        logger.info("PIPELINE COMPLETE")
+        logger.info(f"{'═'*60}")
+        logger.info(f"Files processed: {ok}/{len(mp3_files)}")
+        logger.info(f"Total audio:     {total_audio_sec:.1f}s ({total_audio_hours:.2f}h)")
+        logger.info(f"Total time:      {total_time:.1f}s")
+        if mp3_files:
+            logger.info(f"Avg per file:    {total_time/len(mp3_files):.1f}s")
+        if total_audio_hours > 0:
+            logger.info(f"Avg time per hour audio: {avg_per_hour:.1f}s")
+        logger.info(f"Output:          {output_dir}")
+        logger.info(f"{'═'*60}")
 
-    # ── Summary ────────────────────────────────────────────────────────
-    ok = sum(1 for r in results if r.error is None)
-    avg_per_hour = total_time / total_audio_hours if total_audio_hours > 0 else 0.0
-
-    logger.info(f"\n{'═'*60}")
-    logger.info("PIPELINE COMPLETE")
-    logger.info(f"{'═'*60}")
-    logger.info(f"Files processed: {ok}/{len(mp3_files)}")
-    logger.info(f"Total audio:     {total_audio_sec:.1f}s ({total_audio_hours:.2f}h)")
-    logger.info(f"Total time:      {total_time:.1f}s")
-    if mp3_files:
-        logger.info(f"Avg per file:    {total_time/len(mp3_files):.1f}s")
-    if total_audio_hours > 0:
-        logger.info(f"Avg time per hour audio: {avg_per_hour:.1f}s")
-    logger.info(f"Output:          {output_dir}")
-    logger.info(f"{'═'*60}")
-
-    return ok, total_time, avg_per_hour
+        return ok, total_time, avg_per_hour
+    finally:
+        if opus_pool is not None:
+            opus_pool.shutdown(wait=True)
 
 
 def get_gpu_name() -> str:
