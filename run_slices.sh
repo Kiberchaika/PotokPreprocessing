@@ -1,21 +1,18 @@
 #!/usr/bin/env bash
-# Sequential GPU processing of Music_Part1.01 slices on 188.120.253.126.
+# Sequential GPU processing of Music_Part1.0N slices on 188.120.253.126.
 #
 # Already-complete tracks are skipped by process_remote_streaming.py:
 #   --mode all           needs beats + vocal + music + lyrics
 #   --mode roformer-asr  needs vocal + music + lyrics
 #   --mode beats         needs beats
 #
-# Part02/03 have stems but no beats/lyrics, so --mode all will re-run
-# Roformer on those tracks. Use --mode beats first if you only want
-# missing beat files without re-separating.
-#
 # Usage:
-#   ./run_slices.sh --gpu 0          # Part01 → Part04 on GPU 0 (default)
-#   ./run_slices.sh --gpu 1 03       # only Part03 on GPU 1
-#   ./run_slices.sh --gpu 0 01 04
+#   ./run_slices.sh --gpu 0                # 1.01 Part01 → Part04 on GPU 0
+#   ./run_slices.sh --set 1.02 --gpu 0 01  # Music_Part1.02_Part01
+#   ./run_slices.sh --set 1.02 --gpu 1 02
+#   ./run_slices.sh --gpu 1 03
 #   ./run_slices.sh --gpu 1 --mode beats 02
-#   ./run_slices.sh --test           # include Music_Part1.01_Test
+#   ./run_slices.sh --test                 # include Music_Part1.01_Test
 #   ./run_slices.sh --dry-run 01 02
 #
 # Env:
@@ -32,28 +29,14 @@ SCHEME="${SCHEME:-http}"
 PYTHON="${PYTHON:-python3}"
 MODE="all"
 GPU="${GPU:-0}"
+SET="${SET:-1.01}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 INCLUDE_TEST=0
 DRY_RUN=0
 KEEP_GOING="${KEEP_GOING:-0}"
 
-declare -A PORT=(
-  [01]=8091
-  [02]=8092
-  [03]=8093
-  [04]=8094
-  [test]=8085
-)
-declare -A DATASET=(
-  [01]="/home/k4/Datasets/Music_Part1.01_Part01"
-  [02]="/home/k4/Datasets/Music_Part1.01_Part02"
-  [03]="/home/k4/Datasets/Music_Part1.01_Part03"
-  [04]="/home/k4/Datasets/Music_Part1.01_Part04"
-  [test]="/home/k4/Datasets/Music_Part1.01_Test"
-)
-
 usage() {
-  sed -n '2,22p' "$0" | sed 's/^# \?//'
+  sed -n '2,19p' "$0" | sed 's/^# \?//'
   exit 1
 }
 
@@ -62,6 +45,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --gpu) GPU="${2:?}"; shift 2 ;;
     --mode) MODE="${2:?}"; shift 2 ;;
+    --set) SET="${2:?}"; shift 2 ;;
     --test) INCLUDE_TEST=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --keep-going) KEEP_GOING=1; shift ;;
@@ -72,10 +56,44 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+case "$SET" in
+  1.01)
+    declare -A PORT=(
+      [01]=8091 [02]=8092 [03]=8093 [04]=8094 [test]=8085
+    )
+    declare -A DATASET=(
+      [01]="/home/k4/Datasets/Music_Part1.01_Part01"
+      [02]="/home/k4/Datasets/Music_Part1.01_Part02"
+      [03]="/home/k4/Datasets/Music_Part1.01_Part03"
+      [04]="/home/k4/Datasets/Music_Part1.01_Part04"
+      [test]="/home/k4/Datasets/Music_Part1.01_Test"
+    )
+    DEFAULT_PARTS=(01 02 03 04)
+    ;;
+  1.02)
+    declare -A PORT=(
+      [01]=8095 [02]=8096
+    )
+    declare -A DATASET=(
+      [01]="/home/k4/Datasets/Music_Part1.02_Part01"
+      [02]="/home/k4/Datasets/Music_Part1.02_Part02"
+    )
+    DEFAULT_PARTS=(01 02)
+    ;;
+  *)
+    echo "Invalid --set $SET (1.01|1.02)" >&2
+    exit 1
+    ;;
+esac
+
 if [[ ${#PARTS[@]} -eq 0 ]]; then
-  PARTS=(01 02 03 04)
+  PARTS=("${DEFAULT_PARTS[@]}")
 fi
 if [[ "$INCLUDE_TEST" -eq 1 ]]; then
+  if [[ -z "${PORT[test]+x}" ]]; then
+    echo "--test is only valid with --set 1.01" >&2
+    exit 1
+  fi
   PARTS+=(test)
 fi
 
@@ -99,6 +117,7 @@ mkdir -p "$ROOT/logs"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 
 echo "Host     $HOST"
+echo "Set      $SET"
 echo "GPU      $GPU  (CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES)"
 echo "Mode     $MODE"
 echo "Parts    ${PARTS[*]}"
@@ -111,8 +130,8 @@ run_part() {
   local port="${PORT[$id]}"
   local dataset="${DATASET[$id]}"
   local server="${SCHEME}://${HOST}:${port}/"
-  local work="/tmp/blackbird_processing_${id}"
-  local log="$ROOT/logs/slice_${id}_${MODE}_${STAMP}.log"
+  local work="/tmp/blackbird_processing_${SET}_${id}"
+  local log="$ROOT/logs/slice_${SET}_${id}_${MODE}_${STAMP}.log"
 
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo "  Part $id   port $port"
