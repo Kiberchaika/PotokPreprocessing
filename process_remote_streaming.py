@@ -16,6 +16,14 @@ Usage:
     python process_remote_streaming.py --mode roformer-asr
 """
 
+
+"""
+
+transformers==4.48.3
+huggingface_hub==0.36.2
+
+"""
+
 import argparse
 import json
 import subprocess
