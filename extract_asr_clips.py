@@ -1,7 +1,7 @@
 #!/home/k4/Projects/BirdsMilkDatasetPreprocessing/.venv/bin/python
 """Cut ASR-backed vocal clips from remote Blackbird WebDAV datasets.
 
-1. Download *_voc.opus + *_lyrics.json (ports 8091–8096).
+1. Prefetch *_voc.opus + *_lyrics.json from WebDAV so downloads run ahead of GPU work.
 2. Drop inter-word pauses longer than 3 s; keep shorter gaps. Remap ASR
    word timestamps onto that compact timeline.
 3. Per album: CAM++ of the first 5 s of each track; pick the majority voice.
@@ -24,6 +24,7 @@ import sys
 import threading
 import uuid
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -299,6 +300,25 @@ def split_by_cam(
 # WebDAV / HTTP
 # ---------------------------------------------------------------------------
 
+def make_http_session(auth: HTTPBasicAuth) -> requests.Session:
+    session = requests.Session()
+    session.auth = auth
+    session.trust_env = False
+    session.headers["User-Agent"] = "extract_asr_clips/1.0"
+    return session
+
+
+_tls = threading.local()
+
+
+def thread_session(auth: HTTPBasicAuth) -> requests.Session:
+    sess = getattr(_tls, "session", None)
+    if sess is None:
+        sess = make_http_session(auth)
+        _tls.session = sess
+    return sess
+
+
 def remote_relpath(symbolic: str) -> str:
     parts = symbolic.split("/", 1)
     return parts[1] if len(parts) == 2 else symbolic
@@ -384,7 +404,19 @@ def load_env_file(path: Path) -> None:
             os.environ[key] = value
 
 
-def parse_hf_bucket_url(url: str) -> Tuple[str, str]:
+def parse_ports(raw: Optional[Sequence[str]]) -> List[int]:
+    if not raw:
+        return list(DEFAULT_PORTS)
+    ports: List[int] = []
+    for item in raw:
+        for part in str(item).replace(";", ",").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            ports.append(int(part))
+    if not ports:
+        return list(DEFAULT_PORTS)
+    return ports
     """Return (bucket_id, prefix) from org/bucket[/prefix] or a Hub buckets URL."""
     text = url.strip().rstrip("/")
     for prefix in (
@@ -511,6 +543,16 @@ class HfBucketUploader:
 # ---------------------------------------------------------------------------
 
 @dataclass
+class DownloadedTrack:
+    track: TrackInfo
+    lyrics_remote: str
+    vocal_remote: str
+    lyrics: Optional[Dict[str, Any]] = None
+    vocal_path: Optional[Path] = None
+    error: Optional[str] = None
+
+
+@dataclass
 class PreparedTrack:
     track: TrackInfo
     album: str
@@ -539,59 +581,140 @@ def group_albums(tracks: Sequence[TrackInfo]) -> List[Tuple[Tuple[str, str], Lis
     return sorted(grouped.items(), key=lambda kv: kv[0])
 
 
-def prepare_track(
-    session: requests.Session,
+def download_track(
     base: str,
+    auth: HTTPBasicAuth,
     port: int,
     track: TrackInfo,
     work_dir: Path,
+) -> DownloadedTrack:
+    lyrics_remote = remote_relpath(track.files["lyrics"])
+    vocal_remote = remote_relpath(track.files["vocal"])
+    out = DownloadedTrack(
+        track=track,
+        lyrics_remote=lyrics_remote,
+        vocal_remote=vocal_remote,
+    )
+    session = thread_session(auth)
+    try:
+        out.lyrics = dav_get_json(session, base, lyrics_remote)
+    except Exception as exc:
+        out.error = f"lyrics: {exc}"
+        logger.warning("[%s] lyrics download failed: %s", track.base_name, exc)
+        return out
+    if not load_words(out.lyrics):
+        out.error = "no words"
+        return out
+    dest_dir = work_dir / "prefetch" / str(port) / uuid.uuid4().hex
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    vocal_local = dest_dir / f"{safe_name(track.base_name)}.opus"
+    try:
+        dav_get(session, base, vocal_remote, vocal_local, timeout=600)
+        out.vocal_path = vocal_local
+    except Exception as exc:
+        out.error = f"vocal: {exc}"
+        logger.warning("[%s] vocal download failed: %s", track.base_name, exc)
+        vocal_local.unlink(missing_ok=True)
+    return out
+
+
+def assemble_prepared(
+    downloaded: DownloadedTrack,
     cam: CamPlusEncoder,
     cam_hop: float,
 ) -> Optional[PreparedTrack]:
-    lyrics_remote = remote_relpath(track.files["lyrics"])
-    vocal_remote = remote_relpath(track.files["vocal"])
-    album = track.album_path.split("/")[-1]
-
-    try:
-        lyrics = dav_get_json(session, base, lyrics_remote)
-    except Exception as exc:
-        logger.warning("[%s] lyrics download failed: %s", track.base_name, exc)
+    if downloaded.error or downloaded.lyrics is None or downloaded.vocal_path is None:
         return None
-
-    words = load_words(lyrics)
+    words = load_words(downloaded.lyrics)
     if not words:
         return None
-
-    vocal_local = work_dir / f"{port}_{safe_name(track.base_name)}.opus"
     try:
-        dav_get(session, base, vocal_remote, vocal_local, timeout=600)
-        wav, sr = load_audio_mono(vocal_local)
+        wav, sr = load_audio_mono(downloaded.vocal_path)
     except Exception as exc:
-        logger.warning("[%s] vocal load failed: %s", track.base_name, exc)
+        logger.warning("[%s] vocal load failed: %s", downloaded.track.base_name, exc)
         return None
-    finally:
-        vocal_local.unlink(missing_ok=True)
-
     compact, compact_words = strip_pauses(wav, sr, words)
     if compact.numel() == 0 or not compact_words:
         return None
-
     compact_16k = resample_16k(compact, sr)
     dur = compact_16k.numel() / CAM_SR
     if dur < CAM_MIN_WINDOW:
         return None
     intro_emb = cam.embed(compact_16k, 0.0, min(cam_hop, dur))
+    album = downloaded.track.album_path.split("/")[-1]
     return PreparedTrack(
-        track=track,
+        track=downloaded.track,
         album=album,
         compact=compact,
         compact_16k=compact_16k,
         sr=sr,
         compact_words=compact_words,
         intro_emb=intro_emb,
-        lyrics_remote=lyrics_remote,
-        vocal_remote=vocal_remote,
+        lyrics_remote=downloaded.lyrics_remote,
+        vocal_remote=downloaded.vocal_remote,
     )
+
+
+def cleanup_download(downloaded: DownloadedTrack) -> None:
+    if downloaded.vocal_path is None:
+        return
+    downloaded.vocal_path.unlink(missing_ok=True)
+    parent = downloaded.vocal_path.parent
+    try:
+        parent.rmdir()
+    except OSError:
+        pass
+
+
+class AlbumPrefetch:
+    """Download upcoming albums in the background; processing pulls ready bundles."""
+
+    def __init__(
+        self,
+        base: str,
+        auth: HTTPBasicAuth,
+        port: int,
+        work_dir: Path,
+        albums: Sequence[Tuple[Tuple[str, str], List[TrackInfo]]],
+        download_workers: int,
+        prefetch_albums: int,
+    ):
+        self._base = base
+        self._auth = auth
+        self._port = port
+        self._work_dir = work_dir
+        self._albums = list(albums)
+        self._workers = max(1, download_workers)
+        self._ready: queue.Queue = queue.Queue(maxsize=max(1, prefetch_albums))
+        self._thread = threading.Thread(target=self._producer, name="dav-prefetch", daemon=True)
+        self._thread.start()
+        logger.info(
+            "Prefetch: %d download workers, %d albums ahead",
+            self._workers, max(1, prefetch_albums),
+        )
+
+    def _producer(self) -> None:
+        with ThreadPoolExecutor(max_workers=self._workers) as pool:
+            for key, album_tracks in self._albums:
+                futs = [
+                    pool.submit(
+                        download_track, self._base, self._auth,
+                        self._port, track, self._work_dir,
+                    )
+                    for track in album_tracks
+                ]
+                items = [f.result() for f in futs]
+                self._ready.put((key, items))
+        self._ready.put(None)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> Tuple[Tuple[str, str], List[DownloadedTrack]]:
+        item = self._ready.get()
+        if item is None:
+            raise StopIteration
+        return item
 
 
 def emit_track(
@@ -693,11 +816,9 @@ def emit_track(
 
 
 def process_album(
-    session: requests.Session,
-    base: str,
     host: str,
     port: int,
-    album_tracks: Sequence[TrackInfo],
+    downloaded: Sequence[DownloadedTrack],
     work_dir: Path,
     dry_run: bool,
     clip_quota: Optional[int],
@@ -707,10 +828,15 @@ def process_album(
     uploader: Optional[HfBucketUploader],
 ) -> Tuple[int, int, int]:
     prepared: List[PreparedTrack] = []
-    for track in album_tracks:
-        item = prepare_track(session, base, port, track, work_dir, cam, cam_hop)
-        if item is not None:
-            prepared.append(item)
+    try:
+        for item in downloaded:
+            built = assemble_prepared(item, cam, cam_hop)
+            if built is not None:
+                prepared.append(built)
+    finally:
+        for item in downloaded:
+            cleanup_download(item)
+
     if not prepared:
         return 0, 0, 0
 
@@ -751,12 +877,11 @@ def process_port(
     cam_hop: float,
     cam_sim: float,
     uploader: Optional[HfBucketUploader],
+    download_workers: int,
+    prefetch_albums: int,
 ) -> None:
     base = f"http://{host}:{port}"
-    session = requests.Session()
-    session.auth = auth
-    session.trust_env = False
-    session.headers["User-Agent"] = "extract_asr_clips/1.0"
+    session = make_http_session(auth)
 
     cache = work_dir / f"index_{port}.pickle"
     logger.info("Port %s: downloading index ...", port)
@@ -765,6 +890,7 @@ def process_port(
     except Exception as exc:
         logger.error("Port %s: cannot load index: %s", port, exc)
         return
+    session.close()
 
     tracks = tracks_with_asr(index)
     if max_tracks is not None:
@@ -775,16 +901,9 @@ def process_port(
         port, len(tracks), len(albums),
     )
 
-    written = 0
-    skipped_voice = 0
-    skipped_exist = 0
-    used_albums = 0
+    pending: List[Tuple[Tuple[str, str], List[TrackInfo]]] = []
     skipped_albums = 0
-    pbar = tqdm(albums, desc=f":{port}", unit="album")
-    for (_artist, _album_path), album_tracks in pbar:
-        quota = None if limit is None else max(0, limit - written)
-        if quota == 0:
-            break
+    for (_artist, _album_path), album_tracks in albums:
         sample = album_tracks[0]
         if uploader is not None and uploader.album_exists(
             port, sample.artist, sample.album_path.split("/")[-1],
@@ -794,13 +913,32 @@ def process_port(
                 "SKIP album already on HF: %s / %s",
                 sample.artist, sample.album_path.split("/")[-1],
             )
-            pbar.set_postfix(
-                clips=written, skip_v=skipped_voice,
-                albums=used_albums, skip_alb=skipped_albums,
-            )
             continue
+        pending.append(((_artist, _album_path), album_tracks))
+
+    written = 0
+    skipped_voice = 0
+    skipped_exist = 0
+    used_albums = 0
+    if not pending:
+        logger.info(
+            "Port %s done: nothing to download (%d albums already on HF)",
+            port, skipped_albums,
+        )
+        return
+
+    prefetch = AlbumPrefetch(
+        base, auth, port, work_dir, pending,
+        download_workers=download_workers,
+        prefetch_albums=prefetch_albums,
+    )
+    pbar = tqdm(total=len(pending), desc=f":{port}", unit="album")
+    for (_artist, _album_path), downloaded in prefetch:
+        quota = None if limit is None else max(0, limit - written)
+        if quota == 0:
+            break
         n, sv, se = process_album(
-            session, base, host, port, album_tracks,
+            host, port, downloaded,
             work_dir, dry_run, quota,
             cam, cam_hop, cam_sim, uploader,
         )
@@ -809,6 +947,7 @@ def process_port(
         skipped_exist += se
         if n:
             used_albums += 1
+        pbar.update(1)
         pbar.set_postfix(
             clips=written, skip_v=skipped_voice,
             albums=used_albums, skip_alb=skipped_albums,
@@ -816,7 +955,10 @@ def process_port(
         if limit is not None and written >= limit:
             logger.info("Reached --limit %d clips", limit)
             break
-    session.close()
+    for leftover in prefetch:
+        for item in leftover[1]:
+            cleanup_download(item)
+    pbar.close()
     logger.info(
         "Port %s done: %d new clips, %d skipped (other voice), "
         "%d albums uploaded, %d albums already on HF",
@@ -828,8 +970,11 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Strip vocal pauses, remap ASR, split by CAM++, upload clips to HF bucket")
     p.add_argument("--host", default=DEFAULT_HOST)
-    p.add_argument("--ports", default=",".join(str(x) for x in DEFAULT_PORTS),
-                   help="Comma-separated ports (default: 8091-8096)")
+    p.add_argument(
+        "--ports", nargs="*", default=None, metavar="PORT",
+        help="Server ports to process (default: all %s). "
+             "Example: --ports 8091 8093" % ",".join(str(p) for p in DEFAULT_PORTS),
+    )
     p.add_argument("--username", default=DEFAULT_USER)
     p.add_argument("--password", default=DEFAULT_PASS)
     p.add_argument("--work-dir", type=Path, default=Path("/tmp/extract_asr_clips"))
@@ -838,7 +983,10 @@ def parse_args() -> argparse.Namespace:
                    help="Bucket id or Hub URL")
     p.add_argument("--hf-prefix", default=DEFAULT_HF_PREFIX,
                    help="Extra path prefix inside the bucket")
-    p.add_argument("--hf-workers", type=int, default=2)
+    p.add_argument("--download-workers", type=int, default=4,
+                   help="Parallel WebDAV download threads (default: 4)")
+    p.add_argument("--prefetch-albums", type=int, default=2,
+                   help="How many albums to download ahead of processing (default: 2)")
     p.add_argument("--dry-run", action="store_true",
                    help="Strip pauses + CAM++ split, do not upload")
     p.add_argument("--max-tracks", type=int, default=None,
@@ -872,7 +1020,8 @@ def main() -> None:
     if url_prefix:
         prefix = "/".join(p for p in (url_prefix, prefix) if p)
 
-    ports = [int(x.strip()) for x in args.ports.split(",") if x.strip()]
+    ports = parse_ports(args.ports)
+    logger.info("Ports: %s", ", ".join(str(p) for p in ports))
     args.work_dir.mkdir(parents=True, exist_ok=True)
     auth = HTTPBasicAuth(args.username, args.password)
 
@@ -902,6 +1051,8 @@ def main() -> None:
                 cam_hop=args.cam_hop,
                 cam_sim=args.cam_sim,
                 uploader=uploader,
+                download_workers=args.download_workers,
+                prefetch_albums=args.prefetch_albums,
             )
     finally:
         if uploader is not None:
