@@ -4,3 +4,4 @@
 *.ckpt
 *.pyc
 /logs/
+.env
