@@ -14,6 +14,8 @@ Usage:
     python process_remote_streaming.py --server https://1.2.3.4 --port 9090 --dataset /data/Music
     python process_remote_streaming.py --mode beats --batch-size 8
     python process_remote_streaming.py --mode roformer-asr
+    python process_remote_streaming.py --mode asr --port 8095
+    python process_remote_streaming.py --set-aware  # see run_slices.sh --set 1.02 --mode asr 01
 """
 
 
@@ -32,10 +34,14 @@ import threading
 import time
 from contextlib import ExitStack
 from pathlib import Path
-from urllib.parse import urlparse, urlunparse
+from typing import Optional
+from urllib.parse import quote, urlparse, urlunparse
 
 import librosa
+import requests
 import torch
+import torchaudio
+from requests.auth import HTTPBasicAuth
 from tqdm import tqdm
 
 from audio_pipeline import (
@@ -45,6 +51,7 @@ from audio_pipeline import (
     detect_beats,
     separate_vocals,
     transcribe_audio,
+    transcribe_file,
     logger,
     OPUS_BITRATE_VOCAL,
     OPUS_BITRATE_MUSIC,
@@ -68,8 +75,14 @@ DEFAULT_BATCH_SIZE = 4
 DEFAULT_PREFETCH_WORKERS = 4
 DEFAULT_UPLOAD_WORKERS = 4
 DEFAULT_WORK_DIR = "/tmp/blackbird_processing"
+MIN_LYRICS_BYTES = 80  # empty ASR stub is ~49 bytes
 
-COMPONENTS = ["mp3"]
+COMPONENTS_BY_MODE = {
+    "beats": ["mp3"],
+    "roformer-asr": ["mp3"],
+    "all": ["mp3"],
+    "asr": ["vocal"],
+}
 
 
 def parse_args():
@@ -87,9 +100,11 @@ def parse_args():
                    help=f"SSH key for remote reindex (default: {DEFAULT_SSH_KEY})")
     p.add_argument("--dataset", default=DEFAULT_DATASET_PATH,
                    help=f"Remote dataset path (default: {DEFAULT_DATASET_PATH})")
-    p.add_argument("--mode", choices=["beats", "roformer-asr", "all"],
+    p.add_argument("--mode", choices=["beats", "roformer-asr", "all", "asr"],
                    default=DEFAULT_MODE,
-                   help=f"Processing mode (default: {DEFAULT_MODE})")
+                   help="beats | roformer-asr | all | asr (Parakeet on existing _voc.opus)")
+    p.add_argument("--overwrite", action="store_true",
+                   help="Re-run ASR even if a non-empty *_lyrics.json already exists")
     p.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
                    help=f"Items per take() batch (default: {DEFAULT_BATCH_SIZE})")
     p.add_argument("--work-dir", default=DEFAULT_WORK_DIR,
@@ -117,6 +132,58 @@ def remote_reindex(ssh_key: str, ssh_host: str, dataset_path: str) -> None:
         sys.exit(1)
     print(result.stdout)
     print("Remote reindex completed.\n")
+
+
+def complete_components(track_info) -> set:
+    """Components that already exist with real content (empty lyrics stubs do not count)."""
+    done = set()
+    for name, path in track_info.files.items():
+        size = track_info.file_sizes.get(path)
+        if name == "lyrics" and (size is None or size < MIN_LYRICS_BYTES):
+            continue
+        done.add(name)
+    return done
+
+
+def source_stem(path: Path) -> str:
+    stem = path.stem
+    for suffix in ("_voc", "_vocal", "_music"):
+        if stem.endswith(suffix):
+            return stem[: -len(suffix)]
+    return stem
+
+
+def lyrics_relpath(remote_path: str) -> str:
+    p = Path(remote_path)
+    return str(p.with_name(f"{source_stem(p)}_lyrics.json")).replace("\\", "/")
+
+
+def dav_content_length(session: requests.Session, base: str, rel: str) -> Optional[int]:
+    url = f"{base.rstrip('/')}/{quote(rel.lstrip('/'), safe='/')}"
+    try:
+        resp = session.head(url, timeout=20, allow_redirects=True)
+        if resp.status_code == 404:
+            return None
+        cl = resp.headers.get("Content-Length")
+        if resp.status_code == 200 and cl is not None:
+            return int(cl)
+        resp = session.get(url, timeout=20, stream=True)
+        try:
+            if resp.status_code == 404:
+                return None
+            if resp.status_code != 200:
+                return None
+            cl = resp.headers.get("Content-Length")
+            return int(cl) if cl is not None else None
+        finally:
+            resp.close()
+    except Exception:
+        return None
+
+
+def lyrics_already_done(session: requests.Session, base: str, remote_path: str) -> bool:
+    size = dav_content_length(session, base, lyrics_relpath(remote_path))
+    return size is not None and size >= MIN_LYRICS_BYTES
 
 
 def format_size(size_bytes: int) -> str:
@@ -183,14 +250,18 @@ def main() -> None:
     if mode in ("roformer-asr", "all"):
         roformer_model = load_roformer_model(device)
         asr_model = load_asr_model(device)
+    if mode == "asr":
+        asr_model = load_asr_model(device)
     logger.info(f"Models loaded in {time.perf_counter() - t_load:.1f}s")
+
+    components = COMPONENTS_BY_MODE[mode]
 
     # Step 1: reindex on the server so we get a fresh index
     remote_reindex(args.ssh_key, ssh_host, args.dataset)
 
     # Step 2: connect and stream with updated index
     print(f"Connecting to {server_url} ...")
-    print(f"Components: {COMPONENTS}")
+    print(f"Components: {components}")
     print(f"Mode:       {mode}")
     print(f"Dataset:    {args.dataset}")
     print(f"Work dir:   {args.work_dir}")
@@ -200,7 +271,7 @@ def main() -> None:
         url=server_url,
         username=args.username,
         password=args.password,
-        components=COMPONENTS,
+        components=components,
         queue_size=queue_size,
         prefetch_workers=DEFAULT_PREFETCH_WORKERS,
         upload_workers=DEFAULT_UPLOAD_WORKERS,
@@ -220,25 +291,33 @@ def main() -> None:
 
     run_beats = mode in ("beats", "all")
     run_sep = mode in ("roformer-asr", "all")
+    run_asr_only = mode == "asr"
+    overwrite = args.overwrite
 
-    # Build set of required components based on mode
+    dav = requests.Session()
+    dav.auth = HTTPBasicAuth(args.username, args.password)
+    dav.trust_env = False
+
+    # Skip tracks that already have the outputs this mode would write.
     needed_components = set()
     if run_beats:
         needed_components.add("beats")
     if run_sep:
         needed_components.update(("vocal", "music", "lyrics"))
+    if run_asr_only:
+        needed_components.add("lyrics")
 
     with pipeline:
         # Pre-filter file list: remove tracks that already have all needed components
         idx = pipeline._index
-        if idx and needed_components:
+        if idx and needed_components and not overwrite:
             # Build lookup: (artist, album, track) -> set of existing components
             track_components = {}
             for _, track_info in idx.tracks.items():
                 key = (track_info.artist,
                        track_info.album_path.split("/")[-1],
                        track_info.base_name)
-                track_components[key] = set(track_info.files.keys())
+                track_components[key] = complete_components(track_info)
 
             original_count = len(pipeline._file_list)
             filtered = []
@@ -293,11 +372,52 @@ def main() -> None:
                                f"({format_size(file_size)})")
 
                     try:
-                        dur = librosa.get_duration(path=str(mp3_path))
+                        try:
+                            info = torchaudio.info(str(mp3_path))
+                            dur = info.num_frames / max(info.sample_rate, 1)
+                            if dur > 4 * 3600:
+                                dur = 0.0
+                        except Exception:
+                            dur = librosa.get_duration(path=str(mp3_path))
                         file_start = time.perf_counter()
-                        stem = mp3_path.stem
+                        stem = source_stem(mp3_path)
                         parent = mp3_path.parent
                         beats_path = None
+
+                        if run_asr_only:
+                            remote_lyrics = lyrics_relpath(item.remote_path)
+                            local_lyrics = parent / f"{stem}_lyrics.json"
+                            if not overwrite and (
+                                (local_lyrics.is_file() and local_lyrics.stat().st_size >= MIN_LYRICS_BYTES)
+                                or lyrics_already_done(dav, server_url, item.remote_path)
+                            ):
+                                tqdm.write(f"     skip ASR, exists: {remote_lyrics}")
+                                pipeline.skip(item)
+                                skipped += 1
+                                pbar.update(1)
+                                continue
+                            t1 = time.perf_counter()
+                            asr_out = transcribe_file(asr_model, str(mp3_path))
+                            ms_asr = (time.perf_counter() - t1) * 1000
+                            logger.info(f"[{track}] ASR: {len(asr_out['text'])} chars [{ms_asr:.0f}ms]")
+                            lyrics_data = {
+                                "text": asr_out["text"],
+                                "segments": asr_out["segments"],
+                                "words": asr_out["words"],
+                            }
+                            lyrics_path = parent / f"{stem}_lyrics.json"
+                            lyrics_path.write_text(
+                                json.dumps(lyrics_data, ensure_ascii=False, indent=2))
+                            submit_and_log(pipeline, item, lyrics_path,
+                                           f"{stem}_lyrics.json", stats, stats_lock)
+                            elapsed = time.perf_counter() - file_start
+                            dur_hours = dur / 3600
+                            speed = elapsed / dur_hours if dur_hours > 0 else 0
+                            tqdm.write(f"     done in {elapsed:.1f}s "
+                                       f"({dur:.0f}s audio, {speed:.0f}s per hour of audio)")
+                            processed += 1
+                            pbar.update(1)
+                            continue
 
                         # 1) Beat detection — write JSON now, upload after GPU
                         #    is done with the mp3 (upload workers delete the source).
@@ -343,21 +463,24 @@ def main() -> None:
                                 bitrate=OPUS_BITRATE_MUSIC, on_done=_opus_done)
                             logger.info(f"[{track}] Opus encode queued (background)")
 
-                            t3 = time.perf_counter()
-                            asr_out = transcribe_audio(asr_model, vocals_np)
-                            ms_asr = (time.perf_counter() - t3) * 1000
-                            logger.info(f"[{track}] ASR: {len(asr_out['text'])} chars [{ms_asr:.0f}ms]")
+                            if not overwrite and lyrics_already_done(dav, server_url, item.remote_path):
+                                tqdm.write(f"     skip ASR, exists: {lyrics_relpath(item.remote_path)}")
+                            else:
+                                t3 = time.perf_counter()
+                                asr_out = transcribe_audio(asr_model, vocals_np)
+                                ms_asr = (time.perf_counter() - t3) * 1000
+                                logger.info(f"[{track}] ASR: {len(asr_out['text'])} chars [{ms_asr:.0f}ms]")
 
-                            lyrics_data = {
-                                "text": asr_out["text"],
-                                "segments": asr_out["segments"],
-                                "words": asr_out["words"],
-                            }
-                            lyrics_path = parent / f"{stem}_lyrics.json"
-                            lyrics_path.write_text(
-                                json.dumps(lyrics_data, ensure_ascii=False, indent=2))
-                            submit_and_log(pipeline, item, lyrics_path,
-                                           f"{stem}_lyrics.json", stats, stats_lock)
+                                lyrics_data = {
+                                    "text": asr_out["text"],
+                                    "segments": asr_out["segments"],
+                                    "words": asr_out["words"],
+                                }
+                                lyrics_path = parent / f"{stem}_lyrics.json"
+                                lyrics_path.write_text(
+                                    json.dumps(lyrics_data, ensure_ascii=False, indent=2))
+                                submit_and_log(pipeline, item, lyrics_path,
+                                               f"{stem}_lyrics.json", stats, stats_lock)
 
                         if beats_path is not None:
                             submit_and_log(pipeline, item, beats_path,

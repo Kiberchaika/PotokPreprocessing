@@ -4,6 +4,7 @@
 # Already-complete tracks are skipped by process_remote_streaming.py:
 #   --mode all           needs beats + vocal + music + lyrics
 #   --mode roformer-asr  needs vocal + music + lyrics
+#   --mode asr           needs lyrics with real text (empty stubs are re-done)
 #   --mode beats         needs beats
 #
 # Usage:
@@ -12,6 +13,7 @@
 #   ./run_slices.sh --set 1.02 --gpu 1 02
 #   ./run_slices.sh --gpu 1 03
 #   ./run_slices.sh --gpu 1 --mode beats 02
+#   ./run_slices.sh --set 1.02 --mode asr --gpu 0 01   # port 8095, lyrics only
 #   ./run_slices.sh --test                 # include Music_Part1.01_Test
 #   ./run_slices.sh --dry-run 01 02
 #
@@ -98,8 +100,8 @@ if [[ "$INCLUDE_TEST" -eq 1 ]]; then
 fi
 
 case "$MODE" in
-  all|beats|roformer-asr) ;;
-  *) echo "Invalid --mode $MODE (all|beats|roformer-asr)" >&2; exit 1 ;;
+  all|beats|roformer-asr|asr) ;;
+  *) echo "Invalid --mode $MODE (all|beats|roformer-asr|asr)" >&2; exit 1 ;;
 esac
 
 case "$GPU" in

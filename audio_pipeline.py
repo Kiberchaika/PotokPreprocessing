@@ -489,6 +489,56 @@ def transcribe_audio(asr_model, audio_np: np.ndarray, sample_rate: int = 44_100)
         os.unlink(tmp.name)
 
 
+def _load_audio_for_asr(audio_path: str) -> Tuple[np.ndarray, int]:
+    """Load mono audio without librosa/soundfile (they misread some Opus headers)."""
+    wav = None
+    sr = ASR_TARGET_SR
+    try:
+        wav, sr = torchaudio.load(audio_path)
+    except Exception as exc:
+        logger.warning(f"torchaudio.load failed for {audio_path}: {exc}")
+
+    max_samples = int(4 * 3600 * max(sr, 1))  # 4 hours
+    if wav is None or wav.numel() == 0 or wav.shape[-1] > max_samples:
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
+        try:
+            proc = subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", audio_path,
+                    "-ac", "1", "-ar", str(ASR_TARGET_SR),
+                    "-f", "wav", tmp.name,
+                ],
+                capture_output=True, text=True,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"ffmpeg decode failed: {(proc.stderr or '')[-1500:]}"
+                )
+            wav, sr = torchaudio.load(tmp.name)
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+
+    if wav is None or wav.numel() == 0:
+        raise RuntimeError(f"empty audio: {audio_path}")
+    if wav.shape[-1] > max_samples:
+        raise RuntimeError(
+            f"implausible length {wav.shape[-1]} samples at {sr} Hz: {audio_path}"
+        )
+    if wav.dim() == 2 and wav.size(0) > 1:
+        wav = wav.mean(dim=0, keepdim=True)
+    return wav.squeeze(0).contiguous().numpy(), int(sr)
+
+
+def transcribe_file(asr_model, audio_path: str) -> Dict:
+    """Transcribe an existing vocal file (opus/wav/mp3) with Parakeet."""
+    audio_np, sr = _load_audio_for_asr(audio_path)
+    return transcribe_audio(asr_model, audio_np, sample_rate=sr)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Per-file pipeline
 # ═══════════════════════════════════════════════════════════════════════════
