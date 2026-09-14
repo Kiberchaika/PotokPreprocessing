@@ -44,10 +44,9 @@ DEFAULT_HOST = "188.120.253.126"
 DEFAULT_PORTS = [8091, 8092, 8093, 8094, 8095, 8096]
 DEFAULT_USER = "blackbird"
 DEFAULT_PASS = "dataset"
-DEFAULT_CAMPPLUS_CKPT = Path(
-    "/home/k4/Projects/SingingVoiceSynthesisHack/seed-vc/campplus_cn_common.bin"
-)
-SEED_VC_ROOT = Path("/home/k4/Projects/SingingVoiceSynthesisHack/seed-vc")
+_SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_CAMPPLUS_CKPT = _SCRIPT_DIR / "checkpoints" / "campplus_cn_common.bin"
+SEED_VC_ROOT = _SCRIPT_DIR / "third_party" / "seed-vc"
 
 CAM_HOP = 5.0
 CAM_SIM = 0.8
@@ -417,6 +416,9 @@ def parse_ports(raw: Optional[Sequence[str]]) -> List[int]:
     if not ports:
         return list(DEFAULT_PORTS)
     return ports
+
+
+def parse_hf_bucket_url(url: str) -> Tuple[str, str]:
     """Return (bucket_id, prefix) from org/bucket[/prefix] or a Hub buckets URL."""
     text = url.strip().rstrip("/")
     for prefix in (
@@ -457,6 +459,7 @@ class HfBucketUploader:
         self._batch, self._list_tree = _import_hf_buckets()
         self._q: queue.Queue = queue.Queue(maxsize=64)
         self._album_present: Dict[str, bool] = {}
+        self._listed_ports: set[int] = set()
         self._fail = 0
         self._ok = 0
         self._threads = []
@@ -477,11 +480,45 @@ class HfBucketUploader:
     def album_dir(self, port: int, artist: str, album: str) -> str:
         return self.remote_path(str(port), safe_name(artist), safe_name(album))
 
+    def preload_existing_albums(self, port: int) -> int:
+        """One recursive listing of {prefix}/{port}/; cache which album dirs exist."""
+        if port in self._listed_ports:
+            return sum(1 for k, v in self._album_present.items() if v and k.startswith(self.remote_path(str(port)) + "/"))
+        root = self.remote_path(str(port))
+        album_depth = len(root.split("/")) + 2  # port / artist / album
+        found = 0
+        logger.info("HF: listing existing albums under %s ...", root)
+        try:
+            for item in self._list_tree(
+                self.bucket_id,
+                prefix=root,
+                recursive=True,
+                token=self.token,
+            ):
+                path = (getattr(item, "path", None) or "").strip("/")
+                if not path:
+                    continue
+                parts = path.split("/")
+                if len(parts) < album_depth:
+                    continue
+                album_prefix = "/".join(parts[:album_depth])
+                if not self._album_present.get(album_prefix):
+                    self._album_present[album_prefix] = True
+                    found += 1
+        except Exception as exc:
+            logger.warning("HF list failed for %s: %s — will treat albums as missing", root, exc)
+            return 0
+        self._listed_ports.add(port)
+        logger.info("HF: %d albums already present under %s", found, root)
+        return found
+
     def album_exists(self, port: int, artist: str, album: str) -> bool:
         """True if this album folder already has any files in the bucket."""
         prefix = self.album_dir(port, artist, album)
         if prefix in self._album_present:
             return self._album_present[prefix]
+        if port in self._listed_ports:
+            return False
         exists = False
         try:
             for item in self._list_tree(
@@ -901,6 +938,9 @@ def process_port(
         port, len(tracks), len(albums),
     )
 
+    if uploader is not None:
+        uploader.preload_existing_albums(port)
+
     pending: List[Tuple[Tuple[str, str], List[TrackInfo]]] = []
     skipped_albums = 0
     for (_artist, _album_path), album_tracks in albums:
@@ -909,12 +949,16 @@ def process_port(
             port, sample.artist, sample.album_path.split("/")[-1],
         ):
             skipped_albums += 1
-            logger.info(
+            logger.debug(
                 "SKIP album already on HF: %s / %s",
                 sample.artist, sample.album_path.split("/")[-1],
             )
             continue
         pending.append(((_artist, _album_path), album_tracks))
+    logger.info(
+        "Port %s: %d albums to process, %d already on HF",
+        port, len(pending), skipped_albums,
+    )
 
     written = 0
     skipped_voice = 0
@@ -983,6 +1027,8 @@ def parse_args() -> argparse.Namespace:
                    help="Bucket id or Hub URL")
     p.add_argument("--hf-prefix", default=DEFAULT_HF_PREFIX,
                    help="Extra path prefix inside the bucket")
+    p.add_argument("--hf-workers", type=int, default=2,
+                   help="Background HF bucket upload threads (default: 2)")
     p.add_argument("--download-workers", type=int, default=4,
                    help="Parallel WebDAV download threads (default: 4)")
     p.add_argument("--prefetch-albums", type=int, default=2,
@@ -1011,6 +1057,9 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
     load_env_file(args.env_file)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     if not token and not args.dry_run:
         raise SystemExit(f"HF_TOKEN not found in environment or {args.env_file}")

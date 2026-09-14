@@ -5,3 +5,4 @@
 *.pyc
 /logs/
 .env
+checkpoints/campplus_cn_common.bin
